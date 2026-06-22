@@ -1,0 +1,12 @@
+name: Autofill PR description
+
+on: pull_request
+
+jobs:
+  openai-pr-description:
+    uses: uug-ai/workflows/.github/workflows/pr-description.yml@main
+    with:
+      pr_number: ${{ github.event.number }}
+      pull_request_url: ""
+      overwrite_description: true
+    secrets: inherit
