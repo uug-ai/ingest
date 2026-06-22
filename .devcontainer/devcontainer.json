@@ -1,0 +1,22 @@
+// For format details, see https://aka.ms/devcontainer.json. For config options, see the
+// README at: https://github.com/devcontainers/templates/tree/main/src/go
+{
+	"name": "go:1.25-bookworm",
+	"runArgs": [
+		"--name=ingest",
+		"--network=host"
+	],
+	"dockerFile": "Dockerfile",
+	"mounts": [
+		"source=${localWorkspaceFolder}/../models,target=/workspaces/models,type=bind"
+	],
+	"customizations": {
+		"vscode": {
+			"extensions": [
+				"GitHub.copilot",
+				"ms-azuretools.vscode-docker",
+				"mongodb.mongodb-vscode"
+			]
+		}
+	}
+}

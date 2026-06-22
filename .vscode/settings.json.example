@@ -1,0 +1,10 @@
+{
+    "mdb.presetConnections": [
+        {
+            "name": "MongoDB Atlas Production",
+            "connectionString": "mongodb+srv://xxx:xxxx@xxxx.mongodb.net/?retryWrites=true&w=majority"
+        }
+    ],
+    "git.autofetch": true,
+    "git.enableSmartCommit": true
+}

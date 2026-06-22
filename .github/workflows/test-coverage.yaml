@@ -1,0 +1,21 @@
+name: Test Coverage
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  release:
+    types: [created]
+  push:
+    branches:
+      - main
+
+jobs:
+  test-coverage:
+    uses: uug-ai/workflows/.github/workflows/test-coverage.yaml@main
+    with:
+      organization: uug-ai
+      project: ${{ github.event.repository.name }}
+      go_version: "1.25.8"
+      go_dir: "."
+      go_sum_path: "go.sum"
+      coverage_artifact_name: coverage-report
+    secrets: inherit
