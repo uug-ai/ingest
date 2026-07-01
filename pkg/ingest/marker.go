@@ -71,6 +71,15 @@ func decodeMarker(_ Scope, target Target, payload json.RawMessage) (any, Report,
 		m.DeviceId = target.DeviceId
 	}
 
+	// Authoritative media link: when the producer did not name the recording(s)
+	// explicitly, pin the marker to the target's recording key so the link is the
+	// recording the result was derived from rather than one inferred by timestamp
+	// overlap (which is sensitive to timing/fps drift). The wire may override by
+	// sending its own mediaKeys.
+	if len(m.MediaKeys) == 0 && strings.TrimSpace(target.Key) != "" {
+		m.MediaKeys = []string{strings.TrimSpace(target.Key)}
+	}
+
 	// --- validation ---
 	m.Name = strings.TrimSpace(m.Name)
 	if m.Name == "" {

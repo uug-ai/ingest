@@ -333,109 +333,115 @@ func addMarker(ctxTracer context.Context, tracer *opentelemetry.Tracer, client *
 		}
 	}
 
-	// If mediaIds are provided, update the media documents with marker names, tag names, and event names
-	for _, mediaId := range mediaIds {
-		if mediaId == "" {
-			continue
-		}
-
-		mediaObjectId, err := primitive.ObjectIDFromHex(mediaId)
-		if err != nil {
-			return marker, fmt.Errorf("invalid mediaId format: %w", err)
-		}
-
-		// Collect unique marker names, tag names, and event names
-		var markerNames []string
-		if marker.Name != "" {
-			markerNames = append(markerNames, marker.Name)
-		}
-
-		var tagNames []string
-		for _, tag := range marker.Tags {
-			if tag.Name != "" {
-				tagNames = append(tagNames, tag.Name)
-			}
-		}
-
-		var eventNames []string
-		for _, event := range marker.Events {
-			if event.Name != "" {
-				eventNames = append(eventNames, event.Name)
-			}
-		}
-
-		// Build update document using $addToSet with $each to ensure uniqueness
-		updateDoc := bson.M{}
-		if len(markerNames) > 0 {
-			updateDoc["markerNames"] = bson.M{"$each": markerNames}
-		}
-		if len(tagNames) > 0 {
-			updateDoc["tagNames"] = bson.M{"$each": tagNames}
-		}
-		if len(eventNames) > 0 {
-			updateDoc["eventNames"] = bson.M{"$each": eventNames}
-		}
-
-		if len(updateDoc) > 0 {
-			mediaCol := db.Collection(MEDIA_COLLECTION)
-			filter := bson.M{
-				"_id":            mediaObjectId,
-				"startTimestamp": bson.M{"$lte": marker.EndTimestamp},
-				"endTimestamp":   bson.M{"$gte": marker.StartTimestamp},
-			}
-			update := bson.M{"$addToSet": updateDoc}
-			_, err := mediaCol.UpdateOne(ctx, filter, update)
-			if err != nil {
-				return marker, fmt.Errorf("failed to update media with marker data: %w", err)
-			}
-		}
+	// Media tagging: denormalise the marker/tag/event names onto the media docs so
+	// the frontend can list them without a join. The recording(s) a marker belongs
+	// to are resolved in one of three ways, in priority order:
+	//
+	//  1. Explicit media keys on the marker (authoritative). The producer knows
+	//     exactly which recording(s) the marker was derived from (media.videoFile),
+	//     so stamp those recordings directly — scoped to the marker's device and
+	//     organisation so a caller can only tag media it owns, and with NO
+	//     timestamp guard, since the key is the source of truth (immune to
+	//     timing/fps drift).
+	//  2. Explicit media _ids (legacy by-id authoring path). Stamp those docs,
+	//     still guarded by timestamp overlap.
+	//  3. No explicit reference. Fall back to timestamp overlap on the device.
+	markerNames, tagNames, eventNames := markerDenormNames(marker)
+	updateDoc := bson.M{}
+	if len(markerNames) > 0 {
+		updateDoc["markerNames"] = bson.M{"$each": markerNames}
 	}
+	if len(tagNames) > 0 {
+		updateDoc["tagNames"] = bson.M{"$each": tagNames}
+	}
+	if len(eventNames) > 0 {
+		updateDoc["eventNames"] = bson.M{"$each": eventNames}
+	}
+	update := bson.M{"$addToSet": updateDoc}
 
-	// If we have no mediaIds, it can still be the case media that overlap with the marker exist. In this case we want to update those media with the marker names, tag names, and event names as well for performance reasons on the frontend.
-	if len(mediaIds) == 0 {
-		// Collect unique marker names, tag names, and event names
-		updateDoc := bson.M{}
-		if marker.Name != "" {
-			updateDoc["markerNames"] = bson.M{"$each": []string{marker.Name}}
-		}
-
-		var tagNames []string
-		for _, tag := range marker.Tags {
-			if tag.Name != "" {
-				tagNames = append(tagNames, tag.Name)
-			}
-		}
-		if len(tagNames) > 0 {
-			updateDoc["tagNames"] = bson.M{"$each": tagNames}
-		}
-
-		var eventNames []string
-		for _, event := range marker.Events {
-			if event.Name != "" {
-				eventNames = append(eventNames, event.Name)
-			}
-		}
-		if len(eventNames) > 0 {
-			updateDoc["eventNames"] = bson.M{"$each": eventNames}
-		}
-
+	switch {
+	case len(marker.MediaKeys) > 0:
 		if len(updateDoc) > 0 {
 			mediaCol := db.Collection(MEDIA_COLLECTION)
-			// Find media where the time ranges overlap and the deviceId matches
+			for _, key := range marker.MediaKeys {
+				if key == "" {
+					continue
+				}
+				// Authoritative link by recording key (media.videoFile), scoped to
+				// the marker's device/organisation. No timestamp guard: the key
+				// pins the recording regardless of the marker's absolute timing.
+				filter := bson.M{"videoFile": key}
+				if marker.DeviceId != "" {
+					filter["deviceId"] = marker.DeviceId
+				}
+				if marker.OrganisationId != "" {
+					filter["organisationId"] = marker.OrganisationId
+				}
+				if _, err := mediaCol.UpdateMany(ctx, filter, update); err != nil {
+					return marker, fmt.Errorf("failed to update media by key with marker data: %w", err)
+				}
+			}
+		}
+
+	case len(mediaIds) > 0:
+		for _, mediaId := range mediaIds {
+			if mediaId == "" {
+				continue
+			}
+			mediaObjectId, err := primitive.ObjectIDFromHex(mediaId)
+			if err != nil {
+				return marker, fmt.Errorf("invalid mediaId format: %w", err)
+			}
+			if len(updateDoc) > 0 {
+				mediaCol := db.Collection(MEDIA_COLLECTION)
+				filter := bson.M{
+					"_id":            mediaObjectId,
+					"startTimestamp": bson.M{"$lte": marker.EndTimestamp},
+					"endTimestamp":   bson.M{"$gte": marker.StartTimestamp},
+				}
+				if _, err := mediaCol.UpdateOne(ctx, filter, update); err != nil {
+					return marker, fmt.Errorf("failed to update media with marker data: %w", err)
+				}
+			}
+		}
+
+	default:
+		// No explicit reference: media that overlap with the marker in time may
+		// still exist. Update those (deviceId + timestamp overlap) so the frontend
+		// can list the names without a join.
+		if len(updateDoc) > 0 {
+			mediaCol := db.Collection(MEDIA_COLLECTION)
 			filter := bson.M{
 				"deviceId":       marker.DeviceId,
 				"startTimestamp": bson.M{"$lte": marker.EndTimestamp},
 				"endTimestamp":   bson.M{"$gte": marker.StartTimestamp},
 			}
-			update := bson.M{"$addToSet": updateDoc}
-			_, err := mediaCol.UpdateMany(ctx, filter, update)
-			if err != nil {
+			if _, err := mediaCol.UpdateMany(ctx, filter, update); err != nil {
 				return marker, fmt.Errorf("failed to update overlapping media with marker data: %w", err)
 			}
 		}
 	}
 
 	return marker, nil
+}
+
+// markerDenormNames collects the unique, non-empty marker/tag/event names that
+// are denormalised onto media documents for frontend listing.
+func markerDenormNames(marker models.Marker) (markerNames, tagNames, eventNames []string) {
+	if marker.Name != "" {
+		markerNames = append(markerNames, marker.Name)
+	}
+	for _, tag := range marker.Tags {
+		if tag.Name != "" {
+			tagNames = append(tagNames, tag.Name)
+		}
+	}
+	for _, event := range marker.Events {
+		if event.Name != "" {
+			eventNames = append(eventNames, event.Name)
+		}
+	}
+	return markerNames, tagNames, eventNames
 }
 
 // markerSetDoc marshals a marker through BSON (so its bson tags / omitempty
