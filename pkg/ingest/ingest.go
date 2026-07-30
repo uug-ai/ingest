@@ -62,8 +62,9 @@ var ErrPermanent = errors.New("ingest: permanent sink failure")
 // these; the handlers registry routes on it. A genuinely new shape adds a new
 // constant plus a handler — most new producers just recombine existing types.
 const (
-	KindDetection = "detection" // a run of detection tracks/boxes (detection.go)
-	KindMarker    = "marker"    // a timeline annotation, one models.Marker (marker.go)
+	KindDetection  = "detection"   // a run of detection tracks/boxes (detection.go)
+	KindMarker     = "marker"      // a timeline annotation, one models.Marker (marker.go)
+	KindMediaPatch = "media-patch" // a partial update to one media document (media_patch.go)
 )
 
 // maxBlocksPerPayload caps how many blocks one envelope may carry.
@@ -117,6 +118,10 @@ type Scope struct {
 	// app that routes the "marker" kind; nil otherwise (the action errors if a
 	// marker block arrives without it).
 	Markers MarkerStore
+	// Media is the sink for the media-patch kind's partial update. Required only
+	// by an app that routes the "media-patch" kind; nil otherwise (the action
+	// errors if a media-patch block arrives without it).
+	Media MediaPatcher
 }
 
 // Report is the kind-agnostic envelope every handler returns. Only the
@@ -222,8 +227,9 @@ func (h Handler) AllowsSource(src Source) bool {
 // Adding a kind is a new entry here plus its Decode/Actions; the dispatcher
 // never grows a case.
 var handlers = map[string]Handler{
-	detectionHandler.Kind: detectionHandler,
-	markerHandler.Kind:    markerHandler,
+	detectionHandler.Kind:  detectionHandler,
+	markerHandler.Kind:     markerHandler,
+	mediaPatchHandler.Kind: mediaPatchHandler,
 	// "thumbnail": thumbnailHandler, "sprite": spriteHandler — migrated from
 	// the analyser's hardcoded switch later.
 }

@@ -15,6 +15,7 @@ import (
 	"github.com/uug-ai/ingest/pkg/detections"
 	"github.com/uug-ai/ingest/pkg/ingest"
 	"github.com/uug-ai/ingest/pkg/markers"
+	"github.com/uug-ai/ingest/pkg/media"
 	"github.com/uug-ai/trace/pkg/opentelemetry"
 	"go.mongodb.org/mongo-driver/mongo"
 )
@@ -33,4 +34,12 @@ func NewDetectionStore(db *mongo.Database) ingest.DetectionStore {
 // lookup projections, so a redelivery refreshes rather than duplicates it.
 func NewMarkerStore(client *mongo.Client, tracer *opentelemetry.Tracer) ingest.MarkerStore {
 	return markers.NewStore(client, tracer)
+}
+
+// NewMediaStore builds the Mongo media-patch sink (ingest.MediaPatcher) over the
+// caller's database. It applies an org-scoped $set to the target media document,
+// so a media-patch block from a workflow stage enriches a recording without ever
+// crossing an organisation boundary.
+func NewMediaStore(db *mongo.Database) ingest.MediaPatcher {
+	return media.NewStore(db)
 }

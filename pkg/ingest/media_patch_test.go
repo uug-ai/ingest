@@ -1,0 +1,139 @@
+package ingest
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"testing"
+
+	"go.mongodb.org/mongo-driver/bson/primitive"
+)
+
+// fakeMediaPatcher records the patches applied (and can be made to fail) so the
+// media-patch tests can assert what was written without a database.
+type fakeMediaPatcher struct {
+	calls []mediaPatchCall
+	err   error
+}
+
+type mediaPatchCall struct {
+	organisationId string
+	mediaId        string
+	fields         map[string]any
+}
+
+func (f *fakeMediaPatcher) PatchMedia(_ context.Context, organisationId, mediaId string, fields map[string]any) error {
+	if f.err != nil {
+		return f.err
+	}
+	f.calls = append(f.calls, mediaPatchCall{organisationId: organisationId, mediaId: mediaId, fields: fields})
+	return nil
+}
+
+// mediaPatchBlock builds a media-patch block from a flat body (mediaId plus the
+// fields to set).
+func mediaPatchBlock(t *testing.T, body map[string]any) Block {
+	t.Helper()
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal media-patch block: %v", err)
+	}
+	return Block{Type: KindMediaPatch, Data: raw}
+}
+
+func TestIngestBlocks_MediaPatch(t *testing.T) {
+	store := &fakeMediaPatcher{}
+	scope := Scope{Source: SourcePipeline, Media: store}
+
+	id := primitive.NewObjectID().Hex()
+	batch, err := IngestBlocks(context.Background(), scope, target(), BlockEnvelope{
+		Blocks: []Block{mediaPatchBlock(t, map[string]any{
+			"mediaId":     id,
+			"description": "a new description",
+			"star":        true,
+		})},
+	})
+	if err != nil {
+		t.Fatalf("IngestBlocks: %v", err)
+	}
+	if len(store.calls) != 1 {
+		t.Fatalf("want 1 patch call, got %d", len(store.calls))
+	}
+	call := store.calls[0]
+	if call.mediaId != id {
+		t.Errorf("mediaId = %q, want %q", call.mediaId, id)
+	}
+	if call.organisationId != target().OrganisationId {
+		t.Errorf("organisationId = %q, want %q stamped from target", call.organisationId, target().OrganisationId)
+	}
+	// The wire field names are mapped to their media-document paths.
+	if got, ok := call.fields["metadata.description"]; !ok || got != "a new description" {
+		t.Errorf("fields[metadata.description] = %v (ok=%v), want the description", got, ok)
+	}
+	if got, ok := call.fields["star"]; !ok || got != true {
+		t.Errorf("fields[star] = %v (ok=%v), want true", got, ok)
+	}
+	if _, ok := call.fields["mediaId"]; ok {
+		t.Error("mediaId must not leak into the patched fields")
+	}
+	if len(batch.Blocks) != 1 || batch.Blocks[0].Type != KindMediaPatch {
+		t.Fatalf("want 1 media-patch block report, got %+v", batch.Blocks)
+	}
+	if d, ok := batch.Blocks[0].Detail.(MediaPatchDetail); !ok || d.Fields != 2 {
+		t.Errorf("detail = %#v, want MediaPatchDetail{Fields:2}", batch.Blocks[0].Detail)
+	}
+}
+
+func TestIngestBlocks_MediaPatchRejectsAPISource(t *testing.T) {
+	store := &fakeMediaPatcher{}
+	scope := Scope{Source: SourceAPI, Media: store}
+
+	_, err := IngestBlocks(context.Background(), scope, target(), BlockEnvelope{
+		Blocks: []Block{mediaPatchBlock(t, map[string]any{
+			"mediaId":     primitive.NewObjectID().Hex(),
+			"description": "x",
+		})},
+	})
+	if !errors.Is(err, ErrSourceNotAllowed) {
+		t.Fatalf("err = %v, want ErrSourceNotAllowed (media-patch is pipeline-only)", err)
+	}
+	if len(store.calls) != 0 {
+		t.Errorf("want nothing patched when the source is forbidden, got %d", len(store.calls))
+	}
+}
+
+func TestDecodeMediaPatch_Validation(t *testing.T) {
+	validId := primitive.NewObjectID().Hex()
+	cases := map[string]map[string]any{
+		"missing mediaId":   {"description": "x"},
+		"empty mediaId":     {"mediaId": "  ", "description": "x"},
+		"invalid mediaId":   {"mediaId": "123", "description": "x"},
+		"no fields":         {"mediaId": validId},
+		"unknown field":     {"mediaId": validId, "organisationId": "other-org"},
+		"not-patchable _id": {"mediaId": validId, "id": "x"},
+	}
+	scope := Scope{Source: SourcePipeline, Media: &fakeMediaPatcher{}}
+	for label, body := range cases {
+		t.Run(label, func(t *testing.T) {
+			_, err := IngestBlocks(context.Background(), scope, target(), BlockEnvelope{
+				Blocks: []Block{mediaPatchBlock(t, body)},
+			})
+			if !errors.Is(err, ErrMediaPatchValidation) {
+				t.Fatalf("err = %v, want ErrMediaPatchValidation", err)
+			}
+		})
+	}
+}
+
+func TestApplyMediaPatch_NoStore(t *testing.T) {
+	scope := Scope{Source: SourcePipeline} // Media nil
+	_, err := IngestBlocks(context.Background(), scope, target(), BlockEnvelope{
+		Blocks: []Block{mediaPatchBlock(t, map[string]any{
+			"mediaId":     primitive.NewObjectID().Hex(),
+			"description": "x",
+		})},
+	})
+	if !errors.Is(err, ErrPersist) {
+		t.Fatalf("err = %v, want ErrPersist when no MediaPatcher is configured", err)
+	}
+}
