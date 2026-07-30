@@ -21,7 +21,7 @@ each app's repository layer.
 ## Features
 
 • **Block routing** — one dispatcher fans every block out to its handler by `type`; the dispatcher never grows a `case`.
-• **Typed handlers** — built-in `detection` and `marker` block kinds, each with ordered, idempotent actions.
+• **Typed handlers** — built-in `detection`, `marker` and `media-patch` block kinds, each with ordered, idempotent actions.
 • **Infra-free** — no database or transport dependencies; callers inject sinks via the `Scope`.
 • **Fail-fast validation** — a pre-pass rejects unknown kinds, disallowed sources, and oversized payloads before any side effects.
 • **Source-aware** — the same core enforces different rules for `api` vs `pipeline` callers.
@@ -70,10 +70,15 @@ func run(ctx context.Context, detections ingest.DetectionStore, regions ingest.R
 
 ```
 pkg/ingest/
-├── ingest.go      # dispatcher, envelope/block types, handler registry, IngestBlocks
-├── detection.go   # detection block handler + actions (DetectionStore, RegionPromoter)
-└── marker.go      # marker block handler + action (MarkerStore)
+├── ingest.go       # dispatcher, envelope/block types, handler registry, IngestBlocks
+├── detection.go    # detection block handler + actions (DetectionStore, RegionPromoter)
+├── marker.go       # marker block handler + action (MarkerStore)
+└── media_patch.go  # media-patch block handler + action (MediaPatcher)
 ```
+
+The concrete Mongo sinks live one layer up, in sibling packages the composition
+root wires through `pkg/ingeststore`: `pkg/detections`, `pkg/markers`, and
+`pkg/media` (the media-patch `$set` writer).
 
 ## Development
 
