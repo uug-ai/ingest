@@ -346,7 +346,7 @@ func addMarker(ctxTracer context.Context, tracer *opentelemetry.Tracer, client *
 	//  2. Explicit media _ids (legacy by-id authoring path). Stamp those docs,
 	//     still guarded by timestamp overlap.
 	//  3. No explicit reference. Fall back to timestamp overlap on the device.
-	markerNames, tagNames, eventNames := markerDenormNames(marker)
+	markerNames, tagNames, eventNames, categoryNames := markerDenormNames(marker)
 	updateDoc := bson.M{}
 	if len(markerNames) > 0 {
 		updateDoc["markerNames"] = bson.M{"$each": markerNames}
@@ -356,6 +356,9 @@ func addMarker(ctxTracer context.Context, tracer *opentelemetry.Tracer, client *
 	}
 	if len(eventNames) > 0 {
 		updateDoc["eventNames"] = bson.M{"$each": eventNames}
+	}
+	if len(categoryNames) > 0 {
+		updateDoc["categoryNames"] = bson.M{"$each": categoryNames}
 	}
 	update := bson.M{"$addToSet": updateDoc}
 
@@ -425,9 +428,9 @@ func addMarker(ctxTracer context.Context, tracer *opentelemetry.Tracer, client *
 	return marker, nil
 }
 
-// markerDenormNames collects the unique, non-empty marker/tag/event names that
+// markerDenormNames collects the unique, non-empty marker/tag/event/category names that
 // are denormalised onto media documents for frontend listing.
-func markerDenormNames(marker models.Marker) (markerNames, tagNames, eventNames []string) {
+func markerDenormNames(marker models.Marker) (markerNames, tagNames, eventNames, categoryNames []string) {
 	if marker.Name != "" {
 		markerNames = append(markerNames, marker.Name)
 	}
@@ -441,7 +444,12 @@ func markerDenormNames(marker models.Marker) (markerNames, tagNames, eventNames 
 			eventNames = append(eventNames, event.Name)
 		}
 	}
-	return markerNames, tagNames, eventNames
+	for _, category := range marker.Categories {
+		if category.Name != "" {
+			categoryNames = append(categoryNames, category.Name)
+		}
+	}
+	return markerNames, tagNames, eventNames, categoryNames
 }
 
 // markerSetDoc marshals a marker through BSON (so its bson tags / omitempty
