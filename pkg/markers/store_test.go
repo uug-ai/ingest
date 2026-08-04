@@ -97,6 +97,64 @@ func count(t *testing.T, ctx context.Context, db *mongo.Database, coll string, f
 	return n
 }
 
+// TestMarkerSummaryEntry verifies the per-occurrence markerSummary document is
+// built from the correlated marker fields and omits empty values. It needs no
+// Mongo.
+func TestMarkerSummaryEntry(t *testing.T) {
+	t.Run("populated", func(t *testing.T) {
+		marker := models.Marker{
+			Name:           "person",
+			StartTimestamp: 1000,
+			EndTimestamp:   1010,
+			Events:         []models.MarkerEvent{{Name: "motion"}, {Name: ""}},
+			Tags:           []models.MarkerTag{{Name: "red"}},
+			Categories:     []models.MarkerCategory{{Name: "security"}, {Name: ""}},
+		}
+		entry, ok := markerSummaryEntry(marker)
+		if !ok {
+			t.Fatal("markerSummaryEntry ok = false, want true")
+		}
+		if entry["name"] != "person" {
+			t.Errorf("name = %v, want person", entry["name"])
+		}
+		if entry["startTimestamp"] != int64(1000) || entry["endTimestamp"] != int64(1010) {
+			t.Errorf("timestamps = %v/%v, want 1000/1010", entry["startTimestamp"], entry["endTimestamp"])
+		}
+		assertNames := func(key string, want ...string) {
+			got, _ := entry[key].([]string)
+			if len(got) != len(want) {
+				t.Fatalf("%s = %v, want %v", key, entry[key], want)
+			}
+			for i := range want {
+				if got[i] != want[i] {
+					t.Errorf("%s[%d] = %q, want %q", key, i, got[i], want[i])
+				}
+			}
+		}
+		assertNames("eventNames", "motion")
+		assertNames("tagNames", "red")
+		assertNames("categoryNames", "security")
+	})
+
+	t.Run("empty omitted", func(t *testing.T) {
+		entry, ok := markerSummaryEntry(models.Marker{Name: "solo", StartTimestamp: 5})
+		if !ok {
+			t.Fatal("markerSummaryEntry ok = false, want true")
+		}
+		for _, key := range []string{"eventNames", "tagNames", "categoryNames", "endTimestamp"} {
+			if _, present := entry[key]; present {
+				t.Errorf("expected %q to be omitted, got %v", key, entry[key])
+			}
+		}
+	})
+
+	t.Run("nothing to record", func(t *testing.T) {
+		if _, ok := markerSummaryEntry(models.Marker{}); ok {
+			t.Error("markerSummaryEntry ok = true for empty marker, want false")
+		}
+	})
+}
+
 // TestClassifyWriteError checks that the marker sink tags deterministic Mongo
 // write rejections as permanent — so the ingest core drops rather than loops
 // them — while leaving transient failures retryable. It needs no Mongo (it

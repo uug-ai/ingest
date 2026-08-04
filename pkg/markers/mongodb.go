@@ -346,7 +346,7 @@ func addMarker(ctxTracer context.Context, tracer *opentelemetry.Tracer, client *
 	//  2. Explicit media _ids (legacy by-id authoring path). Stamp those docs,
 	//     still guarded by timestamp overlap.
 	//  3. No explicit reference. Fall back to timestamp overlap on the device.
-	markerNames, tagNames, eventNames := markerDenormNames(marker)
+	markerNames, tagNames, eventNames, categoryNames := markerDenormNames(marker)
 	updateDoc := bson.M{}
 	if len(markerNames) > 0 {
 		updateDoc["markerNames"] = bson.M{"$each": markerNames}
@@ -357,11 +357,30 @@ func addMarker(ctxTracer context.Context, tracer *opentelemetry.Tracer, client *
 	if len(eventNames) > 0 {
 		updateDoc["eventNames"] = bson.M{"$each": eventNames}
 	}
-	update := bson.M{"$addToSet": updateDoc}
+	if len(categoryNames) > 0 {
+		updateDoc["categoryNames"] = bson.M{"$each": categoryNames}
+	}
+
+	// Combined update: $addToSet keeps the flat name arrays deduped for filtering,
+	// while $push appends a per-occurrence markerSummary entry for display. The
+	// $slice bounds the array so busy devices can't grow a media doc without limit
+	// (keeps the most recent markerSummaryMaxEntries entries).
+	update := bson.M{}
+	if len(updateDoc) > 0 {
+		update["$addToSet"] = updateDoc
+	}
+	if summary, ok := markerSummaryEntry(marker); ok {
+		update["$push"] = bson.M{
+			"markerSummary": bson.M{
+				"$each":  []bson.M{summary},
+				"$slice": -markerSummaryMaxEntries,
+			},
+		}
+	}
 
 	switch {
 	case len(marker.MediaKeys) > 0:
-		if len(updateDoc) > 0 {
+		if len(update) > 0 {
 			mediaCol := db.Collection(MEDIA_COLLECTION)
 			for _, key := range marker.MediaKeys {
 				if key == "" {
@@ -392,7 +411,7 @@ func addMarker(ctxTracer context.Context, tracer *opentelemetry.Tracer, client *
 			if err != nil {
 				return marker, fmt.Errorf("invalid mediaId format: %w", err)
 			}
-			if len(updateDoc) > 0 {
+			if len(update) > 0 {
 				mediaCol := db.Collection(MEDIA_COLLECTION)
 				filter := bson.M{
 					"_id":            mediaObjectId,
@@ -409,7 +428,7 @@ func addMarker(ctxTracer context.Context, tracer *opentelemetry.Tracer, client *
 		// No explicit reference: media that overlap with the marker in time may
 		// still exist. Update those (deviceId + timestamp overlap) so the frontend
 		// can list the names without a join.
-		if len(updateDoc) > 0 {
+		if len(update) > 0 {
 			mediaCol := db.Collection(MEDIA_COLLECTION)
 			filter := bson.M{
 				"deviceId":       marker.DeviceId,
@@ -425,9 +444,9 @@ func addMarker(ctxTracer context.Context, tracer *opentelemetry.Tracer, client *
 	return marker, nil
 }
 
-// markerDenormNames collects the unique, non-empty marker/tag/event names that
+// markerDenormNames collects the unique, non-empty marker/tag/event/category names that
 // are denormalised onto media documents for frontend listing.
-func markerDenormNames(marker models.Marker) (markerNames, tagNames, eventNames []string) {
+func markerDenormNames(marker models.Marker) (markerNames, tagNames, eventNames, categoryNames []string) {
 	if marker.Name != "" {
 		markerNames = append(markerNames, marker.Name)
 	}
@@ -441,7 +460,48 @@ func markerDenormNames(marker models.Marker) (markerNames, tagNames, eventNames 
 			eventNames = append(eventNames, event.Name)
 		}
 	}
-	return markerNames, tagNames, eventNames
+	for _, category := range marker.Categories {
+		if category.Name != "" {
+			categoryNames = append(categoryNames, category.Name)
+		}
+	}
+	return markerNames, tagNames, eventNames, categoryNames
+}
+
+// markerSummaryMaxEntries caps the per-media markerSummary array so append-only
+// $push growth stays bounded on busy devices (the $slice keeps the most recent
+// entries).
+const markerSummaryMaxEntries = 200
+
+// markerSummaryEntry builds the per-occurrence markerSummary document for a
+// marker, preserving the correlation between the marker's name, its
+// category/event/tag names and its time range. The second return is false when
+// the marker carries nothing worth recording.
+func markerSummaryEntry(marker models.Marker) (bson.M, bool) {
+	_, tagNames, eventNames, categoryNames := markerDenormNames(marker)
+	entry := bson.M{}
+	if marker.Name != "" {
+		entry["name"] = marker.Name
+	}
+	if len(categoryNames) > 0 {
+		entry["categoryNames"] = categoryNames
+	}
+	if len(eventNames) > 0 {
+		entry["eventNames"] = eventNames
+	}
+	if len(tagNames) > 0 {
+		entry["tagNames"] = tagNames
+	}
+	if marker.StartTimestamp != 0 {
+		entry["startTimestamp"] = marker.StartTimestamp
+	}
+	if marker.EndTimestamp != 0 {
+		entry["endTimestamp"] = marker.EndTimestamp
+	}
+	if len(entry) == 0 {
+		return nil, false
+	}
+	return entry, true
 }
 
 // markerSetDoc marshals a marker through BSON (so its bson tags / omitempty
