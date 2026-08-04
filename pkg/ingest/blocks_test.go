@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+
+	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
 // Ingest is a test-only single-block convenience over IngestBlocks. Production
@@ -78,6 +80,36 @@ func TestIngestBlocks_UnknownTypeRejectsWholeEnvelope(t *testing.T) {
 	}
 }
 
+func TestIngestBlocks_DecodeFailureRejectsBeforeAnyWrite(t *testing.T) {
+	detections := &fakeStore{}
+	media := &fakeMediaPatcher{}
+	scope := Scope{
+		Source:     SourcePipeline,
+		Detections: detections,
+		Regions:    &fakePromoter{},
+		Media:      media,
+	}
+
+	_, err := IngestBlocks(context.Background(), scope, target(), BlockEnvelope{
+		Blocks: []Block{
+			detectionBlock(t, "RUN-1"),
+			mediaPatchBlock(t, map[string]any{
+				"mediaId": primitive.NewObjectID().Hex(),
+				"star":    "not-a-boolean",
+			}),
+		},
+	})
+	if !errors.Is(err, ErrMediaPatchValidation) {
+		t.Fatalf("err = %v, want ErrMediaPatchValidation", err)
+	}
+	if len(detections.runs) != 0 {
+		t.Errorf("want no detection write before full decode succeeds, got %d", len(detections.runs))
+	}
+	if len(media.calls) != 0 {
+		t.Errorf("want no media write before full decode succeeds, got %d", len(media.calls))
+	}
+}
+
 func TestIngestBlocks_PersistErrorTagged(t *testing.T) {
 	store := &fakeStore{err: errors.New("mongo down")}
 	scope := Scope{Source: SourcePipeline, Detections: store, Regions: &fakePromoter{}}
@@ -123,7 +155,7 @@ func TestHandlerAllowsSource(t *testing.T) {
 // the same shape, without importing this package.
 type permanentSinkErr struct{ msg string }
 
-func (e permanentSinkErr) Error() string  { return e.msg }
+func (e permanentSinkErr) Error() string   { return e.msg }
 func (e permanentSinkErr) Permanent() bool { return true }
 
 func TestIsPermanent(t *testing.T) {

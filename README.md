@@ -23,7 +23,7 @@ each app's repository layer.
 • **Block routing** — one dispatcher fans every block out to its handler by `type`; the dispatcher never grows a `case`.
 • **Typed handlers** — built-in `detection`, `marker` and `media-patch` block kinds, each with ordered, idempotent actions.
 • **Infra-free** — no database or transport dependencies; callers inject sinks via the `Scope`.
-• **Fail-fast validation** — a pre-pass rejects unknown kinds, disallowed sources, and oversized payloads before any side effects.
+• **Fail-fast validation** — a pre-pass rejects unknown kinds, disallowed sources, oversized payloads, and malformed block bodies before any side effects.
 • **Source-aware** — the same core enforces different rules for `api` vs `pipeline` callers.
 
 ## Installation

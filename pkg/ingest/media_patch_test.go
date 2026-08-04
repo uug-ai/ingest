@@ -125,6 +125,77 @@ func TestDecodeMediaPatch_Validation(t *testing.T) {
 	}
 }
 
+func TestDecodeMediaPatch_RejectsEmptyOrganisation(t *testing.T) {
+	store := &fakeMediaPatcher{}
+	scope := Scope{Source: SourcePipeline, Media: store}
+	tgt := target()
+	tgt.OrganisationId = "  "
+
+	_, err := IngestBlocks(context.Background(), scope, tgt, BlockEnvelope{
+		Blocks: []Block{mediaPatchBlock(t, map[string]any{
+			"mediaId":     primitive.NewObjectID().Hex(),
+			"description": "x",
+		})},
+	})
+	if !errors.Is(err, ErrMediaPatchValidation) {
+		t.Fatalf("err = %v, want ErrMediaPatchValidation", err)
+	}
+	if len(store.calls) != 0 {
+		t.Errorf("empty organisation must not reach the media sink, got %d call(s)", len(store.calls))
+	}
+}
+
+func TestDecodeMediaPatch_ValidatesFieldTypes(t *testing.T) {
+	validId := primitive.NewObjectID().Hex()
+	cases := map[string]map[string]any{
+		"null description":      {"mediaId": validId, "description": nil},
+		"object description":    {"mediaId": validId, "description": map[string]any{"text": "x"}},
+		"null star":             {"mediaId": validId, "star": nil},
+		"string star":           {"mediaId": validId, "star": "true"},
+		"null tag names":        {"mediaId": validId, "tagNames": nil},
+		"scalar tag names":      {"mediaId": validId, "tagNames": "tag"},
+		"non-string tag name":   {"mediaId": validId, "tagNames": []any{"tag", 1}},
+		"non-string event name": {"mediaId": validId, "eventNames": []any{false}},
+		"object marker names":   {"mediaId": validId, "markerNames": map[string]any{}},
+	}
+	scope := Scope{Source: SourcePipeline, Media: &fakeMediaPatcher{}}
+	for label, body := range cases {
+		t.Run(label, func(t *testing.T) {
+			_, err := IngestBlocks(context.Background(), scope, target(), BlockEnvelope{
+				Blocks: []Block{mediaPatchBlock(t, body)},
+			})
+			if !errors.Is(err, ErrMediaPatchValidation) {
+				t.Fatalf("err = %v, want ErrMediaPatchValidation", err)
+			}
+		})
+	}
+}
+
+func TestDecodeMediaPatch_AcceptsDocumentedFieldTypes(t *testing.T) {
+	store := &fakeMediaPatcher{}
+	scope := Scope{Source: SourcePipeline, Media: store}
+
+	_, err := IngestBlocks(context.Background(), scope, target(), BlockEnvelope{
+		Blocks: []Block{mediaPatchBlock(t, map[string]any{
+			"mediaId":     primitive.NewObjectID().Hex(),
+			"description": "",
+			"star":        false,
+			"tagNames":    []string{},
+			"eventNames":  []string{"motion"},
+			"markerNames": []string{"person"},
+		})},
+	})
+	if err != nil {
+		t.Fatalf("IngestBlocks: %v", err)
+	}
+	if len(store.calls) != 1 {
+		t.Fatalf("want 1 patch call, got %d", len(store.calls))
+	}
+	if _, ok := store.calls[0].fields["tagNames"].([]string); !ok {
+		t.Errorf("tagNames type = %T, want []string", store.calls[0].fields["tagNames"])
+	}
+}
+
 func TestApplyMediaPatch_NoStore(t *testing.T) {
 	scope := Scope{Source: SourcePipeline} // Media nil
 	_, err := IngestBlocks(context.Background(), scope, target(), BlockEnvelope{
@@ -133,7 +204,7 @@ func TestApplyMediaPatch_NoStore(t *testing.T) {
 			"description": "x",
 		})},
 	})
-	if !errors.Is(err, ErrPersist) {
-		t.Fatalf("err = %v, want ErrPersist when no MediaPatcher is configured", err)
+	if !errors.Is(err, ErrPermanent) {
+		t.Fatalf("err = %v, want ErrPermanent when no MediaPatcher is configured", err)
 	}
 }

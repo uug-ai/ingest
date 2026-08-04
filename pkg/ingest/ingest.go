@@ -236,11 +236,12 @@ var handlers = map[string]Handler{
 
 // IngestBlocks is the single entry point a producer's result flows through. The
 // payload is a self-describing BlockEnvelope: a variable-length, possibly
-// heterogeneous list of blocks. It validates the envelope up front — the block
-// cap, and that every block type is registered and permitted for this source —
-// so an unknown or forbidden block rejects the whole result before any write,
-// then decodes and applies each block in order. A sink failure is tagged
-// ErrPersist so the caller can retry; a decode/validation failure is not.
+// heterogeneous list of blocks. It validates and decodes the complete envelope
+// up front, so an unknown, forbidden, or malformed block rejects the whole result
+// before any write, then applies each decoded block in order. A sink failure is
+// tagged ErrPersist so the caller can retry; a decode/validation failure is not.
+// Writes are individually idempotent but are not a cross-collection transaction:
+// a sink failure can occur after an earlier block has already been written.
 func IngestBlocks(ctx context.Context, scope Scope, target Target, env BlockEnvelope) (BatchReport, error) {
 	var batch BatchReport
 
@@ -248,8 +249,8 @@ func IngestBlocks(ctx context.Context, scope Scope, target Target, env BlockEnve
 		return batch, fmt.Errorf("%w: %d exceeds limit of %d", ErrTooManyBlocks, len(env.Blocks), maxBlocksPerPayload)
 	}
 
-	// Pre-pass: reject an unknown or forbidden block before applying any block,
-	// so a bad envelope never leaves a partial write behind.
+	// Pre-pass: reject an unknown or forbidden block before decoding or applying
+	// any block.
 	for i, b := range env.Blocks {
 		h, ok := handlers[b.Type]
 		if !ok {
@@ -260,31 +261,40 @@ func IngestBlocks(ctx context.Context, scope Scope, target Target, env BlockEnve
 		}
 	}
 
+	type decodedBlock struct {
+		block   Block
+		handler Handler
+		run     any
+		report  Report
+	}
+	decoded := make([]decodedBlock, 0, len(env.Blocks))
 	for i, b := range env.Blocks {
 		h := handlers[b.Type]
-
 		run, report, err := h.Decode(scope, target, b.Data)
 		if err != nil {
 			return batch, fmt.Errorf("ingest: block %d (%s): %w", i, b.Type, err)
 		}
+		decoded = append(decoded, decodedBlock{block: b, handler: h, run: run, report: report})
+	}
 
-		for _, a := range h.Actions {
+	for i, d := range decoded {
+		for _, a := range d.handler.Actions {
 			if !a.RunFor(scope.Source) {
 				continue
 			}
-			if err := a.Apply(ctx, scope, target, run); err != nil {
+			if err := a.Apply(ctx, scope, target, d.run); err != nil {
 				// A deterministic rejection (validator/duplicate key) can only repeat
 				// on redelivery, so tag it ErrPermanent — the caller drops and records
 				// the result instead of re-queuing it forever. Every other sink failure
 				// stays ErrPersist (retryable).
 				if IsPermanent(err) {
-					return batch, fmt.Errorf("%w: block %d (%s) action %q: %v", ErrPermanent, i, b.Type, a.Name(), err)
+					return batch, fmt.Errorf("%w: block %d (%s) action %q: %v", ErrPermanent, i, d.block.Type, a.Name(), err)
 				}
-				return batch, fmt.Errorf("%w: block %d (%s) action %q: %v", ErrPersist, i, b.Type, a.Name(), err)
+				return batch, fmt.Errorf("%w: block %d (%s) action %q: %v", ErrPersist, i, d.block.Type, a.Name(), err)
 			}
 		}
 
-		batch.Blocks = append(batch.Blocks, BlockReport{Type: b.Type, Report: report})
+		batch.Blocks = append(batch.Blocks, BlockReport{Type: d.block.Type, Report: d.report})
 	}
 
 	return batch, nil
