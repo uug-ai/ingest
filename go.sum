@@ -41,8 +41,8 @@ github.com/sirupsen/logrus v1.9.4 h1:TsZE7l11zFCLZnZ+teH4Umoq5BhEIfIzfRDZ1Uzql2w
 github.com/sirupsen/logrus v1.9.4/go.mod h1:ftWc9WdOfJ0a92nsE2jF5u5ZwH8Bv2zdeOC42RjbV2g=
 github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu7U=
 github.com/stretchr/testify v1.11.1/go.mod h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD981Nm4B6U=
-github.com/uug-ai/models v1.6.7 h1:/1GpEuTS9YGFh4va1Wz6KGHlw3D7wKfN7p4giWr9VJY=
-github.com/uug-ai/models v1.6.7/go.mod h1:Ts/6PtFhsFOkZQRuC/tntFBG8Fl1BGICC6dmubXULbk=
+github.com/uug-ai/models v1.7.4 h1:AwBO9LS7U+tDnLSnFwm7/2uis/gwgXYLeeJvgrtjBDg=
+github.com/uug-ai/models v1.7.4/go.mod h1:Ts/6PtFhsFOkZQRuC/tntFBG8Fl1BGICC6dmubXULbk=
 github.com/uug-ai/trace v1.1.0 h1:JNLfwrs8A23LDHR+JXpDszI+O423k78B8nq9GeAgzSs=
 github.com/uug-ai/trace v1.1.0/go.mod h1:V1uDCf2a5QhF2/bwymmh6xabUJ41KY8M079oWT1xyfE=
 github.com/xdg-go/pbkdf2 v1.0.0 h1:Su7DPu48wXMwC3bs7MCNG+z4FhcyEuz5dlvchbq0B0c=
