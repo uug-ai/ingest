@@ -14,11 +14,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 // MediaCollection is the collection media documents live in, shared with hub-api.
@@ -31,22 +33,30 @@ const timeout = 10 * time.Second
 // the ingest.MediaPatcher interface. It holds the Mongo database media documents
 // are stored in.
 type Store struct {
-	db *mongo.Database
+	collection mediaCollection
+}
+
+type mediaCollection interface {
+	UpdateOne(context.Context, any, any, ...*options.UpdateOptions) (*mongo.UpdateResult, error)
 }
 
 // NewStore builds the ingest media-patch sink over a Mongo database.
 func NewStore(db *mongo.Database) *Store {
-	return &Store{db: db}
+	return &Store{collection: db.Collection(MediaCollection)}
 }
 
 // PatchMedia applies fields ($set) to the media document identified by mediaId,
 // scoped to organisationId so a stage can never patch a recording another
 // organisation owns. The update is idempotent (setting the same values again is a
-// no-op) and matching no document is a no-op, not an error — a patch to an
-// unknown or foreign media simply changes nothing. An unparseable id is a
-// deterministic, non-retryable failure. It satisfies ingest.MediaPatcher so the
-// orchestrator can use it as a sink without importing this package's Mongo deps.
+// no-op). An empty organisation, unparseable id, or unknown/foreign media is a
+// deterministic, non-retryable failure: none can be repaired by redelivery, and
+// reporting success would let the workflow advertise a patch that never landed.
+// It satisfies ingest.MediaPatcher so the orchestrator can use it as a sink
+// without importing this package's Mongo deps.
 func (s *Store) PatchMedia(ctx context.Context, organisationId, mediaId string, fields map[string]any) error {
+	if strings.TrimSpace(organisationId) == "" {
+		return permanentWriteError{err: errors.New("media-patch: organisation id is required")}
+	}
 	if len(fields) == 0 {
 		return nil
 	}
@@ -60,12 +70,15 @@ func (s *Store) PatchMedia(ctx context.Context, organisationId, mediaId string, 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	filter := bson.M{"_id": oid}
-	if organisationId != "" {
-		filter["organisationId"] = organisationId
+	filter := bson.M{"_id": oid, "organisationId": organisationId}
+	result, err := s.collection.UpdateOne(ctx, filter, bson.M{"$set": fields})
+	if err != nil {
+		return classifyWriteError(err)
 	}
-	_, err = s.db.Collection(MediaCollection).UpdateOne(ctx, filter, bson.M{"$set": fields})
-	return classifyWriteError(err)
+	if result.MatchedCount == 0 {
+		return permanentWriteError{err: fmt.Errorf("media-patch: media %q was not found in the target organisation", mediaId)}
+	}
+	return nil
 }
 
 // permanentWriteError marks a Mongo write failure the ingest core must not retry:

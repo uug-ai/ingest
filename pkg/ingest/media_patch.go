@@ -1,6 +1,7 @@
 package ingest
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -18,7 +19,8 @@ import (
 // a recording it does not own) and MUST be idempotent — a media-patch sets the
 // same fields to the same values on every at-least-once redelivery, so a replay
 // is a harmless no-op. A patch whose media id resolves to no owned document is a
-// no-op, not an error.
+// deterministic, non-retryable error so the caller does not advertise a patch
+// that never landed.
 type MediaPatcher interface {
 	// PatchMedia applies fields ($set) to the media document identified by
 	// mediaId within organisationId. fields is keyed by the media document's own
@@ -89,7 +91,11 @@ func (d MediaPatchDetail) Summary() string {
 // one field, rejects any field outside the patchable allow-list, and maps each
 // wire field name to its media document path. It runs once per block; PatchMedia
 // consumes its typed output.
-func decodeMediaPatch(_ Scope, _ Target, payload json.RawMessage) (any, Report, error) {
+func decodeMediaPatch(_ Scope, target Target, payload json.RawMessage) (any, Report, error) {
+	if strings.TrimSpace(target.OrganisationId) == "" {
+		return nil, Report{}, fmt.Errorf("%w: target organisationId is required", ErrMediaPatchValidation)
+	}
+
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(payload, &raw); err != nil {
 		return nil, Report{}, fmt.Errorf("ingest: decode media-patch payload: %w", err)
@@ -127,9 +133,9 @@ func decodeMediaPatch(_ Scope, _ Target, payload json.RawMessage) (any, Report, 
 		if !allowed {
 			return nil, Report{}, fmt.Errorf("%w: field %q is not patchable", ErrMediaPatchValidation, key)
 		}
-		var val any
-		if err := json.Unmarshal(valRaw, &val); err != nil {
-			return nil, Report{}, fmt.Errorf("%w: field %q has an invalid value: %v", ErrMediaPatchValidation, key, err)
+		val, err := decodeMediaPatchValue(key, valRaw)
+		if err != nil {
+			return nil, Report{}, fmt.Errorf("%w: field %q %v", ErrMediaPatchValidation, key, err)
 		}
 		set[path] = val
 	}
@@ -137,6 +143,40 @@ func decodeMediaPatch(_ Scope, _ Target, payload json.RawMessage) (any, Report, 
 	run := MediaPatch{MediaId: mediaId, Set: set}
 	report := Report{RunId: mediaId, Detail: MediaPatchDetail{Fields: len(set)}}
 	return run, report, nil
+}
+
+// decodeMediaPatchValue enforces the public wire contract before a value reaches
+// Mongo. Field-name validation alone is insufficient: MongoDB accepts arbitrary
+// BSON shapes, so a string in star or an object in tagNames would otherwise
+// corrupt later typed reads and filters. null is rejected for every field;
+// callers clear description with "" and arrays with [].
+func decodeMediaPatchValue(key string, raw json.RawMessage) (any, error) {
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return nil, errors.New("must not be null")
+	}
+
+	switch key {
+	case "description":
+		var value string
+		if err := json.Unmarshal(raw, &value); err != nil {
+			return nil, errors.New("must be a string")
+		}
+		return value, nil
+	case "star":
+		var value bool
+		if err := json.Unmarshal(raw, &value); err != nil {
+			return nil, errors.New("must be a boolean")
+		}
+		return value, nil
+	case "tagNames", "eventNames", "markerNames":
+		var value []string
+		if err := json.Unmarshal(raw, &value); err != nil {
+			return nil, errors.New("must be an array of strings")
+		}
+		return value, nil
+	default:
+		return nil, errors.New("is not patchable")
+	}
 }
 
 // --- Action ----------------------------------------------------------------
@@ -160,7 +200,7 @@ func (PatchMedia) Apply(ctx context.Context, scope Scope, target Target, run any
 		return fmt.Errorf("ingest: patch expected MediaPatch, got %T", run)
 	}
 	if scope.Media == nil {
-		return errors.New("ingest: no MediaPatcher configured on scope")
+		return fmt.Errorf("%w: no MediaPatcher configured on scope", ErrPermanent)
 	}
 	return scope.Media.PatchMedia(ctx, target.OrganisationId, p.MediaId, p.Set)
 }
