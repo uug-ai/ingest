@@ -41,7 +41,7 @@ func TestPatchMedia_RejectsEmptyOrganisation(t *testing.T) {
 	collection := &fakeMediaCollection{}
 	store := &Store{collection: collection}
 
-	err := store.PatchMedia(context.Background(), "  ", primitive.NewObjectID().Hex(), map[string]any{"star": true})
+	err := store.PatchMedia(context.Background(), "  ", primitive.NewObjectID().Hex(), "", map[string]any{"star": true})
 	if !isPermanent(err) {
 		t.Fatalf("err = %v, want permanent failure", err)
 	}
@@ -55,7 +55,7 @@ func TestPatchMedia_UsesMandatoryOrganisationScope(t *testing.T) {
 	store := &Store{collection: collection}
 	id := primitive.NewObjectID()
 
-	err := store.PatchMedia(context.Background(), "org-1", id.Hex(), map[string]any{"star": true})
+	err := store.PatchMedia(context.Background(), "org-1", id.Hex(), "", map[string]any{"star": true})
 	if err != nil {
 		t.Fatalf("PatchMedia: %v", err)
 	}
@@ -78,7 +78,7 @@ func TestPatchMedia_UnmatchedTargetIsPermanent(t *testing.T) {
 	collection := &fakeMediaCollection{result: &mongo.UpdateResult{MatchedCount: 0}}
 	store := &Store{collection: collection}
 
-	err := store.PatchMedia(context.Background(), "org-1", primitive.NewObjectID().Hex(), map[string]any{"star": true})
+	err := store.PatchMedia(context.Background(), "org-1", primitive.NewObjectID().Hex(), "", map[string]any{"star": true})
 	if !isPermanent(err) {
 		t.Fatalf("err = %v, want permanent failure", err)
 	}
@@ -88,11 +88,68 @@ func TestPatchMedia_TransientWriteErrorRemainsRetryable(t *testing.T) {
 	collection := &fakeMediaCollection{err: errors.New("mongo unavailable")}
 	store := &Store{collection: collection}
 
-	err := store.PatchMedia(context.Background(), "org-1", primitive.NewObjectID().Hex(), map[string]any{"star": true})
+	err := store.PatchMedia(context.Background(), "org-1", primitive.NewObjectID().Hex(), "", map[string]any{"star": true})
 	if err == nil {
 		t.Fatal("want write error")
 	}
 	if isPermanent(err) {
 		t.Fatalf("transient error was marked permanent: %v", err)
+	}
+}
+
+func TestPatchMedia_FallsBackToKey(t *testing.T) {
+	collection := &fakeMediaCollection{result: &mongo.UpdateResult{MatchedCount: 1, ModifiedCount: 1}}
+	store := &Store{collection: collection}
+
+	err := store.PatchMedia(context.Background(), "org-1", "", "recording-key.mp4", map[string]any{"metadata.description": "Number plate detected: ABC123"})
+	if err != nil {
+		t.Fatalf("PatchMedia: %v", err)
+	}
+	filter, ok := collection.filter.(bson.M)
+	if !ok {
+		t.Fatalf("filter type = %T, want bson.M", collection.filter)
+	}
+	if filter["videoFile"] != "recording-key.mp4" {
+		t.Errorf("filter videoFile = %v, want recording-key.mp4", filter["videoFile"])
+	}
+	if filter["organisationId"] != "org-1" {
+		t.Errorf("filter organisationId = %v, want org-1 (key path must stay org-scoped)", filter["organisationId"])
+	}
+	if _, hasId := filter["_id"]; hasId {
+		t.Error("key-targeted patch must not carry an _id filter")
+	}
+}
+
+func TestPatchMedia_PrefersIdWhenBothSupplied(t *testing.T) {
+	collection := &fakeMediaCollection{result: &mongo.UpdateResult{MatchedCount: 1, ModifiedCount: 1}}
+	store := &Store{collection: collection}
+	id := primitive.NewObjectID()
+
+	err := store.PatchMedia(context.Background(), "org-1", id.Hex(), "recording-key.mp4", map[string]any{"star": true})
+	if err != nil {
+		t.Fatalf("PatchMedia: %v", err)
+	}
+	filter, ok := collection.filter.(bson.M)
+	if !ok {
+		t.Fatalf("filter type = %T, want bson.M", collection.filter)
+	}
+	if filter["_id"] != id {
+		t.Errorf("filter _id = %v, want %v (id is primary)", filter["_id"], id)
+	}
+	if _, hasKey := filter["videoFile"]; hasKey {
+		t.Error("id-targeted patch must not also filter by key")
+	}
+}
+
+func TestPatchMedia_RequiresAnIdentifier(t *testing.T) {
+	collection := &fakeMediaCollection{}
+	store := &Store{collection: collection}
+
+	err := store.PatchMedia(context.Background(), "org-1", "  ", "  ", map[string]any{"star": true})
+	if !isPermanent(err) {
+		t.Fatalf("err = %v, want permanent failure when neither id nor key is supplied", err)
+	}
+	if collection.calls != 0 {
+		t.Errorf("an identifier-less patch must not reach Mongo, got %d call(s)", collection.calls)
 	}
 }
