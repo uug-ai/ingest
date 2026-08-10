@@ -22,11 +22,13 @@ import (
 // deterministic, non-retryable error so the caller does not advertise a patch
 // that never landed.
 type MediaPatcher interface {
-	// PatchMedia applies fields ($set) to the media document identified by
-	// mediaId within organisationId. fields is keyed by the media document's own
+	// PatchMedia applies fields ($set) to the media document identified within
+	// organisationId by mediaId (its _id) when non-empty, otherwise by mediaKey
+	// (its recording key). The decode step guarantees at least one identifier is
+	// non-empty and prefers the id. fields is keyed by the media document's own
 	// (dot-notation) field paths, already validated against the patchable allow
 	// list by the decode step.
-	PatchMedia(ctx context.Context, organisationId, mediaId string, fields map[string]any) error
+	PatchMedia(ctx context.Context, organisationId, mediaId, mediaKey string, fields map[string]any) error
 }
 
 // ErrMediaPatchValidation tags a non-retryable media-patch validation failure (a
@@ -34,9 +36,16 @@ type MediaPatcher interface {
 // fix it, so the caller drops the block rather than re-queuing it.
 var ErrMediaPatchValidation = errors.New("ingest: invalid media-patch block")
 
-// mediaIdField is the reserved key that names the target media document; every
-// other key in the block is a field to patch.
-const mediaIdField = "mediaId"
+// mediaIdField and mediaKeyField are the reserved keys that name the target media
+// document: mediaIdField by its _id (the primary target) and mediaKeyField by its
+// recording key (media.videoFile, the fallback). Every other key in the block is
+// a field to patch. A DB-free pipeline stage that only knows the recording key —
+// it never resolves the _id — supplies mediaKey instead, mirroring how the
+// marker/detection sinks already link a recording by its key.
+const (
+	mediaIdField  = "mediaId"
+	mediaKeyField = "mediaKey"
+)
 
 // maxMediaPatchFields caps how many fields one media-patch block may set — a
 // boundary guard against an oversized payload.
@@ -68,11 +77,14 @@ var mediaPatchHandler = Handler{
 	Actions: []Action{PatchMedia{}},
 }
 
-// MediaPatch is the media-patch kind's typed run: the target media id and the
-// already-validated, org-scoped $set field map (keyed by media document paths).
+// MediaPatch is the media-patch kind's typed run: the target media id and/or key
+// and the already-validated, org-scoped $set field map (keyed by media document
+// paths). MediaId is the primary target; MediaKey is the fallback when the
+// emitter only knows the recording key. At least one is non-empty.
 type MediaPatch struct {
-	MediaId string
-	Set     map[string]any
+	MediaId  string
+	MediaKey string
+	Set      map[string]any
 }
 
 // MediaPatchDetail is the media-patch kind's ReportDetail: how many fields the
@@ -101,24 +113,28 @@ func decodeMediaPatch(_ Scope, target Target, payload json.RawMessage) (any, Rep
 		return nil, Report{}, fmt.Errorf("ingest: decode media-patch payload: %w", err)
 	}
 
-	idRaw, ok := raw[mediaIdField]
-	if !ok {
-		return nil, Report{}, fmt.Errorf("%w: %s is required", ErrMediaPatchValidation, mediaIdField)
+	mediaId, err := optionalStringField(raw, mediaIdField)
+	if err != nil {
+		return nil, Report{}, err
 	}
-	var mediaId string
-	if err := json.Unmarshal(idRaw, &mediaId); err != nil {
-		return nil, Report{}, fmt.Errorf("%w: %s must be a string", ErrMediaPatchValidation, mediaIdField)
+	mediaKey, err := optionalStringField(raw, mediaKeyField)
+	if err != nil {
+		return nil, Report{}, err
 	}
-	mediaId = strings.TrimSpace(mediaId)
-	if mediaId == "" {
-		return nil, Report{}, fmt.Errorf("%w: %s is required", ErrMediaPatchValidation, mediaIdField)
+	// mediaId is the primary target: when present it names a document by its _id, so
+	// reject a malformed one here (a non-retryable validation failure) so the sink
+	// never has to. mediaKey is the fallback for a stage that only knows the
+	// recording key; it is an opaque string the sink resolves.
+	if mediaId != "" {
+		if _, err := primitive.ObjectIDFromHex(mediaId); err != nil {
+			return nil, Report{}, fmt.Errorf("%w: %s %q is not a valid id", ErrMediaPatchValidation, mediaIdField, mediaId)
+		}
 	}
-	// The media id names a document by its _id; reject a malformed one here (a
-	// non-retryable validation failure) so the sink never has to.
-	if _, err := primitive.ObjectIDFromHex(mediaId); err != nil {
-		return nil, Report{}, fmt.Errorf("%w: %s %q is not a valid id", ErrMediaPatchValidation, mediaIdField, mediaId)
+	if mediaId == "" && mediaKey == "" {
+		return nil, Report{}, fmt.Errorf("%w: %s or %s is required", ErrMediaPatchValidation, mediaIdField, mediaKeyField)
 	}
 	delete(raw, mediaIdField)
+	delete(raw, mediaKeyField)
 
 	if len(raw) == 0 {
 		return nil, Report{}, fmt.Errorf("%w: at least one field to patch is required", ErrMediaPatchValidation)
@@ -140,9 +156,30 @@ func decodeMediaPatch(_ Scope, target Target, payload json.RawMessage) (any, Rep
 		set[path] = val
 	}
 
-	run := MediaPatch{MediaId: mediaId, Set: set}
-	report := Report{RunId: mediaId, Detail: MediaPatchDetail{Fields: len(set)}}
+	// The report's RunId identifies the patched target in the ingest log: prefer the
+	// _id, fall back to the recording key.
+	runId := mediaId
+	if runId == "" {
+		runId = mediaKey
+	}
+	run := MediaPatch{MediaId: mediaId, MediaKey: mediaKey, Set: set}
+	report := Report{RunId: runId, Detail: MediaPatchDetail{Fields: len(set)}}
 	return run, report, nil
+}
+
+// optionalStringField reads a reserved string key (a media identifier) from the
+// decoded block body, trimming surrounding space. A missing key yields "" with no
+// error; a present but non-string value is a non-retryable validation failure.
+func optionalStringField(raw map[string]json.RawMessage, name string) (string, error) {
+	valRaw, ok := raw[name]
+	if !ok {
+		return "", nil
+	}
+	var s string
+	if err := json.Unmarshal(valRaw, &s); err != nil {
+		return "", fmt.Errorf("%w: %s must be a string", ErrMediaPatchValidation, name)
+	}
+	return strings.TrimSpace(s), nil
 }
 
 // decodeMediaPatchValue enforces the public wire contract before a value reaches
@@ -202,5 +239,5 @@ func (PatchMedia) Apply(ctx context.Context, scope Scope, target Target, run any
 	if scope.Media == nil {
 		return fmt.Errorf("%w: no MediaPatcher configured on scope", ErrPermanent)
 	}
-	return scope.Media.PatchMedia(ctx, target.OrganisationId, p.MediaId, p.Set)
+	return scope.Media.PatchMedia(ctx, target.OrganisationId, p.MediaId, p.MediaKey, p.Set)
 }

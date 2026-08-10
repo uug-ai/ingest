@@ -45,38 +45,56 @@ func NewStore(db *mongo.Database) *Store {
 	return &Store{collection: db.Collection(MediaCollection)}
 }
 
-// PatchMedia applies fields ($set) to the media document identified by mediaId,
-// scoped to organisationId so a stage can never patch a recording another
-// organisation owns. The update is idempotent (setting the same values again is a
-// no-op). An empty organisation, unparseable id, or unknown/foreign media is a
-// deterministic, non-retryable failure: none can be repaired by redelivery, and
-// reporting success would let the workflow advertise a patch that never landed.
-// It satisfies ingest.MediaPatcher so the orchestrator can use it as a sink
-// without importing this package's Mongo deps.
-func (s *Store) PatchMedia(ctx context.Context, organisationId, mediaId string, fields map[string]any) error {
+// PatchMedia applies fields ($set) to the media document identified within
+// organisationId by mediaId (its _id, when non-empty) or otherwise by mediaKey
+// (its recording key, media.videoFile). The update is always scoped to
+// organisationId so a stage can never patch a recording another organisation
+// owns, and it is idempotent (setting the same values again is a no-op). An empty
+// organisation, no usable identifier, an unparseable id, or unknown/foreign media
+// is a deterministic, non-retryable failure: none can be repaired by redelivery,
+// and reporting success would let the workflow advertise a patch that never
+// landed. It satisfies ingest.MediaPatcher so the orchestrator can use it as a
+// sink without importing this package's Mongo deps.
+func (s *Store) PatchMedia(ctx context.Context, organisationId, mediaId, mediaKey string, fields map[string]any) error {
 	if strings.TrimSpace(organisationId) == "" {
 		return permanentWriteError{err: errors.New("media-patch: organisation id is required")}
 	}
 	if len(fields) == 0 {
 		return nil
 	}
-	oid, err := primitive.ObjectIDFromHex(mediaId)
-	if err != nil {
-		// A malformed id repeats on every redelivery, so it is permanent: drop
-		// and record rather than re-queue forever.
-		return permanentWriteError{err: fmt.Errorf("media-patch: invalid media id %q: %w", mediaId, err)}
+
+	// mediaId (the _id) is the primary target; mediaKey (media.videoFile) is the
+	// fallback for a DB-free stage that only knows the recording key. Both paths
+	// stay scoped to organisationId so the org can never be escaped.
+	filter := bson.M{"organisationId": organisationId}
+	target := strings.TrimSpace(mediaId)
+	switch {
+	case target != "":
+		oid, err := primitive.ObjectIDFromHex(target)
+		if err != nil {
+			// A malformed id repeats on every redelivery, so it is permanent: drop
+			// and record rather than re-queue forever.
+			return permanentWriteError{err: fmt.Errorf("media-patch: invalid media id %q: %w", mediaId, err)}
+		}
+		filter["_id"] = oid
+	default:
+		key := strings.TrimSpace(mediaKey)
+		if key == "" {
+			return permanentWriteError{err: errors.New("media-patch: a media id or key is required")}
+		}
+		filter["videoFile"] = key
+		target = "key " + key
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	filter := bson.M{"_id": oid, "organisationId": organisationId}
 	result, err := s.collection.UpdateOne(ctx, filter, bson.M{"$set": fields})
 	if err != nil {
 		return classifyWriteError(err)
 	}
 	if result.MatchedCount == 0 {
-		return permanentWriteError{err: fmt.Errorf("media-patch: media %q was not found in the target organisation", mediaId)}
+		return permanentWriteError{err: fmt.Errorf("media-patch: media %q was not found in the target organisation", target)}
 	}
 	return nil
 }

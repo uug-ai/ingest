@@ -19,19 +19,20 @@ type fakeMediaPatcher struct {
 type mediaPatchCall struct {
 	organisationId string
 	mediaId        string
+	mediaKey       string
 	fields         map[string]any
 }
 
-func (f *fakeMediaPatcher) PatchMedia(_ context.Context, organisationId, mediaId string, fields map[string]any) error {
+func (f *fakeMediaPatcher) PatchMedia(_ context.Context, organisationId, mediaId, mediaKey string, fields map[string]any) error {
 	if f.err != nil {
 		return f.err
 	}
-	f.calls = append(f.calls, mediaPatchCall{organisationId: organisationId, mediaId: mediaId, fields: fields})
+	f.calls = append(f.calls, mediaPatchCall{organisationId: organisationId, mediaId: mediaId, mediaKey: mediaKey, fields: fields})
 	return nil
 }
 
-// mediaPatchBlock builds a media-patch block from a flat body (mediaId plus the
-// fields to set).
+// mediaPatchBlock builds a media-patch block from a flat body (mediaId/mediaKey
+// plus the fields to set).
 func mediaPatchBlock(t *testing.T, body map[string]any) Block {
 	t.Helper()
 	raw, err := json.Marshal(body)
@@ -84,6 +85,65 @@ func TestIngestBlocks_MediaPatch(t *testing.T) {
 	}
 }
 
+func TestIngestBlocks_MediaPatchByKey(t *testing.T) {
+	store := &fakeMediaPatcher{}
+	scope := Scope{Source: SourcePipeline, Media: store}
+
+	_, err := IngestBlocks(context.Background(), scope, target(), BlockEnvelope{
+		Blocks: []Block{mediaPatchBlock(t, map[string]any{
+			"mediaKey":    "1712000000_6-967003_device_0-0-0-0_60_1000.mp4",
+			"description": "Number plate detected: ABC123",
+		})},
+	})
+	if err != nil {
+		t.Fatalf("IngestBlocks: %v", err)
+	}
+	if len(store.calls) != 1 {
+		t.Fatalf("want 1 patch call, got %d", len(store.calls))
+	}
+	call := store.calls[0]
+	if call.mediaId != "" {
+		t.Errorf("mediaId = %q, want empty when only a key is supplied", call.mediaId)
+	}
+	if call.mediaKey != "1712000000_6-967003_device_0-0-0-0_60_1000.mp4" {
+		t.Errorf("mediaKey = %q, want the recording key passed through", call.mediaKey)
+	}
+	if got, ok := call.fields["metadata.description"]; !ok || got != "Number plate detected: ABC123" {
+		t.Errorf("fields[metadata.description] = %v (ok=%v), want the description", got, ok)
+	}
+	if _, ok := call.fields["mediaKey"]; ok {
+		t.Error("mediaKey must not leak into the patched fields")
+	}
+}
+
+func TestIngestBlocks_MediaPatchPrefersIdOverKey(t *testing.T) {
+	store := &fakeMediaPatcher{}
+	scope := Scope{Source: SourcePipeline, Media: store}
+
+	id := primitive.NewObjectID().Hex()
+	_, err := IngestBlocks(context.Background(), scope, target(), BlockEnvelope{
+		Blocks: []Block{mediaPatchBlock(t, map[string]any{
+			"mediaId":     id,
+			"mediaKey":    "some-key.mp4",
+			"description": "x",
+		})},
+	})
+	if err != nil {
+		t.Fatalf("IngestBlocks: %v", err)
+	}
+	if len(store.calls) != 1 {
+		t.Fatalf("want 1 patch call, got %d", len(store.calls))
+	}
+	// Both identifiers are passed through; the sink prefers the id. The decode
+	// still validates the id even when a key is also present.
+	if store.calls[0].mediaId != id {
+		t.Errorf("mediaId = %q, want %q", store.calls[0].mediaId, id)
+	}
+	if store.calls[0].mediaKey != "some-key.mp4" {
+		t.Errorf("mediaKey = %q, want it passed through alongside the id", store.calls[0].mediaKey)
+	}
+}
+
 func TestIngestBlocks_MediaPatchRejectsAPISource(t *testing.T) {
 	store := &fakeMediaPatcher{}
 	scope := Scope{Source: SourceAPI, Media: store}
@@ -105,12 +165,14 @@ func TestIngestBlocks_MediaPatchRejectsAPISource(t *testing.T) {
 func TestDecodeMediaPatch_Validation(t *testing.T) {
 	validId := primitive.NewObjectID().Hex()
 	cases := map[string]map[string]any{
-		"missing mediaId":   {"description": "x"},
-		"empty mediaId":     {"mediaId": "  ", "description": "x"},
-		"invalid mediaId":   {"mediaId": "123", "description": "x"},
-		"no fields":         {"mediaId": validId},
-		"unknown field":     {"mediaId": validId, "organisationId": "other-org"},
-		"not-patchable _id": {"mediaId": validId, "id": "x"},
+		"missing id and key":       {"description": "x"},
+		"blank id and key":         {"mediaId": "  ", "mediaKey": "  ", "description": "x"},
+		"invalid mediaId":          {"mediaId": "123", "description": "x"},
+		"invalid id even with key": {"mediaId": "123", "mediaKey": "k.mp4", "description": "x"},
+		"no fields":                {"mediaId": validId},
+		"key but no fields":        {"mediaKey": "k.mp4"},
+		"unknown field":            {"mediaId": validId, "organisationId": "other-org"},
+		"not-patchable _id":        {"mediaId": validId, "id": "x"},
 	}
 	scope := Scope{Source: SourcePipeline, Media: &fakeMediaPatcher{}}
 	for label, body := range cases {
