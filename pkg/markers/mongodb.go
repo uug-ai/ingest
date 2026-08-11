@@ -498,6 +498,9 @@ func markerSummaryEntry(marker models.Marker) (bson.M, bool) {
 	if marker.EndTimestamp != 0 {
 		entry["endTimestamp"] = marker.EndTimestamp
 	}
+	if len(marker.Detections) > 0 {
+		entry["detections"] = marker.Detections
+	}
 	if len(entry) == 0 {
 		return nil, false
 	}
