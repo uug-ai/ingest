@@ -340,9 +340,10 @@ func addMarker(ctxTracer context.Context, tracer *opentelemetry.Tracer, client *
 	//  1. Explicit media keys on the marker (authoritative). The producer knows
 	//     exactly which recording(s) the marker was derived from (media.videoFile),
 	//     so stamp those recordings directly — scoped to the marker's device and
-	//     organisation so a caller can only tag media it owns, and with NO
-	//     timestamp guard, since the key is the source of truth (immune to
-	//     timing/fps drift).
+	//     organisation so a caller can only tag media it owns (see
+	//     mediaDeviceScope for why the device predicate is not "deviceId"), and
+	//     with NO timestamp guard, since the key is the source of truth (immune
+	//     to timing/fps drift).
 	//  2. Explicit media _ids (legacy by-id authoring path). Stamp those docs,
 	//     still guarded by timestamp overlap.
 	//  3. No explicit reference. Fall back to timestamp overlap on the device.
@@ -386,17 +387,7 @@ func addMarker(ctxTracer context.Context, tracer *opentelemetry.Tracer, client *
 				if key == "" {
 					continue
 				}
-				// Authoritative link by recording key (media.videoFile), scoped to
-				// the marker's device/organisation. No timestamp guard: the key
-				// pins the recording regardless of the marker's absolute timing.
-				filter := bson.M{"videoFile": key}
-				if marker.DeviceId != "" {
-					filter["deviceId"] = marker.DeviceId
-				}
-				if marker.OrganisationId != "" {
-					filter["organisationId"] = marker.OrganisationId
-				}
-				if _, err := mediaCol.UpdateMany(ctx, filter, update); err != nil {
+				if _, err := mediaCol.UpdateMany(ctx, mediaLinkFilter(marker, key), update); err != nil {
 					return marker, fmt.Errorf("failed to update media by key with marker data: %w", err)
 				}
 			}
@@ -426,22 +417,74 @@ func addMarker(ctxTracer context.Context, tracer *opentelemetry.Tracer, client *
 
 	default:
 		// No explicit reference: media that overlap with the marker in time may
-		// still exist. Update those (deviceId + timestamp overlap) so the frontend
+		// still exist. Update those (device + timestamp overlap) so the frontend
 		// can list the names without a join.
 		if len(update) > 0 {
 			mediaCol := db.Collection(MEDIA_COLLECTION)
-			filter := bson.M{
-				"deviceId":       marker.DeviceId,
-				"startTimestamp": bson.M{"$lte": marker.EndTimestamp},
-				"endTimestamp":   bson.M{"$gte": marker.StartTimestamp},
-			}
-			if _, err := mediaCol.UpdateMany(ctx, filter, update); err != nil {
+			if _, err := mediaCol.UpdateMany(ctx, mediaOverlapFilter(marker), update); err != nil {
 				return marker, fmt.Errorf("failed to update overlapping media with marker data: %w", err)
 			}
 		}
 	}
 
 	return marker, nil
+}
+
+// mediaDeviceScope is the media-collection predicate that narrows a marker write
+// to the device the marker belongs to.
+//
+// models.Marker.DeviceId carries the device *key* — every producer fills it from
+// media.DeviceKey — while a media document stores that key under "deviceKey".
+// media."deviceId" is a different, deprecated field that nothing writes:
+// models.Media tags it `bson:"deviceId,omitempty"` and PipelineEvent.GetMedia
+// only ever assigns DeviceKey, on both the structured-metadata and the legacy
+// filename path, so omitempty leaves the field out of the stored document
+// entirely. Filtering on "deviceId" therefore compares a device key against a
+// field that is not there: UpdateMany matches nothing and returns no error, so
+// the marker is written while the media is silently never tagged.
+//
+// Both names are accepted — "deviceKey" is what the pipeline writes today,
+// "deviceId" keeps any legacy document that predates the rename resolvable. An
+// empty key yields a predicate that matches nothing (both fields are omitempty,
+// so no document stores ""), which keeps a marker with no device from tagging
+// every recording in the collection.
+func mediaDeviceScope(deviceKey string) []bson.M {
+	return []bson.M{
+		{"deviceKey": deviceKey},
+		{"deviceId": deviceKey},
+	}
+}
+
+// mediaLinkFilter selects the recording a marker names explicitly, by its key
+// (media.videoFile). There is deliberately no timestamp guard: the key pins the
+// recording regardless of the marker's absolute timing, which is what makes this
+// path immune to the drift the overlap fallback suffers from.
+//
+// The device and organisation predicates are applied only when the marker
+// carries them, so a caller can only tag media it owns. The organisation
+// predicate needs media.organisationId to be populated — the monitor stage
+// stamps it (models.PipelineEvent.copyOwnershipToMedia) — so where ownership has
+// not been propagated yet this matches nothing by design rather than tagging
+// across tenants.
+func mediaLinkFilter(marker models.Marker, key string) bson.M {
+	filter := bson.M{"videoFile": key}
+	if marker.DeviceId != "" {
+		filter["$or"] = mediaDeviceScope(marker.DeviceId)
+	}
+	if marker.OrganisationId != "" {
+		filter["organisationId"] = marker.OrganisationId
+	}
+	return filter
+}
+
+// mediaOverlapFilter is the fallback for a marker that names no recording at
+// all: every media on the same device whose span overlaps the marker's.
+func mediaOverlapFilter(marker models.Marker) bson.M {
+	return bson.M{
+		"$or":            mediaDeviceScope(marker.DeviceId),
+		"startTimestamp": bson.M{"$lte": marker.EndTimestamp},
+		"endTimestamp":   bson.M{"$gte": marker.StartTimestamp},
+	}
 }
 
 // markerDenormNames collects the unique, non-empty marker/tag/event/category names that

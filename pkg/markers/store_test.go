@@ -155,6 +155,91 @@ func TestMarkerSummaryEntry(t *testing.T) {
 	})
 }
 
+// TestMediaLinkFilter pins the media-collection predicate used by the
+// authoritative by-key path. The regression it guards is a silent one: filtering
+// on media."deviceId" — a deprecated field no producer writes — matches zero
+// documents and returns no error, so the marker lands with its mediaKeys while
+// the media is never tagged. It needs no Mongo.
+func TestMediaLinkFilter(t *testing.T) {
+	marker := models.Marker{
+		DeviceId:       "device-key-1",
+		OrganisationId: "org-1",
+	}
+	filter := mediaLinkFilter(marker, "org/recording.mp4")
+
+	if filter["videoFile"] != "org/recording.mp4" {
+		t.Errorf("videoFile = %v, want org/recording.mp4", filter["videoFile"])
+	}
+	if filter["organisationId"] != "org-1" {
+		t.Errorf("organisationId = %v, want org-1", filter["organisationId"])
+	}
+	if _, present := filter["deviceId"]; present {
+		t.Error("device must not be matched on the top-level deprecated deviceId field")
+	}
+	// The key pins the recording, so a timestamp guard would only reintroduce
+	// drift sensitivity.
+	for _, key := range []string{"startTimestamp", "endTimestamp"} {
+		if _, present := filter[key]; present {
+			t.Errorf("by-key link must not carry a %s guard", key)
+		}
+	}
+	assertDeviceScope(t, filter, "device-key-1")
+
+	t.Run("omits absent scopes", func(t *testing.T) {
+		bare := mediaLinkFilter(models.Marker{}, "org/recording.mp4")
+		for _, key := range []string{"$or", "organisationId"} {
+			if _, present := bare[key]; present {
+				t.Errorf("expected %q to be omitted for a marker that carries no scope", key)
+			}
+		}
+	})
+}
+
+// TestMediaOverlapFilter pins the no-reference fallback: same device, overlapping
+// span. It shares the device predicate with the by-key path, so it carries the
+// same deviceKey correction.
+func TestMediaOverlapFilter(t *testing.T) {
+	filter := mediaOverlapFilter(models.Marker{
+		DeviceId:       "device-key-1",
+		StartTimestamp: 1000,
+		EndTimestamp:   1010,
+	})
+
+	assertDeviceScope(t, filter, "device-key-1")
+	if start, _ := filter["startTimestamp"].(bson.M); start["$lte"] != int64(1010) {
+		t.Errorf("startTimestamp = %v, want $lte 1010", filter["startTimestamp"])
+	}
+	if end, _ := filter["endTimestamp"].(bson.M); end["$gte"] != int64(1000) {
+		t.Errorf("endTimestamp = %v, want $gte 1000", filter["endTimestamp"])
+	}
+}
+
+// assertDeviceScope checks that a filter narrows to the device by the live
+// deviceKey field while still resolving legacy documents that stored the key
+// under deviceId.
+func assertDeviceScope(t *testing.T, filter bson.M, deviceKey string) {
+	t.Helper()
+	scope, ok := filter["$or"].([]bson.M)
+	if !ok {
+		t.Fatalf("$or = %v, want a device scope", filter["$or"])
+	}
+	matched := map[string]bool{}
+	for _, clause := range scope {
+		for field, value := range clause {
+			if value != deviceKey {
+				t.Errorf("%s = %v, want %q", field, value, deviceKey)
+			}
+			matched[field] = true
+		}
+	}
+	if !matched["deviceKey"] {
+		t.Error("device scope must match media.deviceKey, the field producers actually write")
+	}
+	if !matched["deviceId"] {
+		t.Error("device scope must still resolve legacy media that stored the key under deviceId")
+	}
+}
+
 // TestClassifyWriteError checks that the marker sink tags deterministic Mongo
 // write rejections as permanent — so the ingest core drops rather than loops
 // them — while leaving transient failures retryable. It needs no Mongo (it
