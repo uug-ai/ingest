@@ -14,6 +14,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/uug-ai/ingest/internal/projectfilter"
 	"github.com/uug-ai/models/pkg/models"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
@@ -41,10 +42,15 @@ func NewStore(db *mongo.Database) *Store {
 }
 
 // UpsertDetectionRun persists the run, replacing any prior run with the same
-// (key, organisationId, source.runId) so at-least-once redelivery stays
-// idempotent. _id and createdAt are owned by the first insert and never
+// (key, organisationId, projectId, source.runId) so at-least-once redelivery
+// stays idempotent. _id and createdAt are owned by the first insert and never
 // overwritten on replace. It satisfies ingest.DetectionStore so the orchestrator
 // can use it as a sink without importing this package's Mongo deps.
+//
+// The project predicate is tolerant of runs written before the field existed
+// (see internal/projectfilter), and $set carries the stamped projectId — so a
+// matched legacy run is refreshed and back-filled by this same operation rather
+// than duplicated beside it.
 func (s *Store) UpsertDetectionRun(ctx context.Context, run models.DetectionRun) error {
 	coll := s.db.Collection(DetectionsCollection)
 	now := time.Now().UnixMilli()
@@ -56,11 +62,7 @@ func (s *Store) UpsertDetectionRun(ctx context.Context, run models.DetectionRun)
 	run.CreatedAt = 0
 	run.UpdatedAt = now
 
-	filter := bson.M{
-		"key":            run.Key,
-		"organisationId": run.OrganisationId,
-		"source.runId":   run.Source.RunId,
-	}
+	filter := upsertFilter(run)
 	update := bson.M{
 		"$set":         run,
 		"$setOnInsert": bson.M{"createdAt": now},
@@ -74,4 +76,14 @@ func (s *Store) UpsertDetectionRun(ctx context.Context, run models.DetectionRun)
 		_, err = coll.UpdateOne(ctx, filter, update)
 	}
 	return err
+}
+
+// upsertFilter is the run's stable identity. It is a function rather than an
+// inline literal so the tenant scoping can be asserted without a database.
+func upsertFilter(run models.DetectionRun) bson.M {
+	return projectfilter.Apply(bson.M{
+		"key":            run.Key,
+		"organisationId": run.OrganisationId,
+		"source.runId":   run.Source.RunId,
+	}, run.ProjectId)
 }

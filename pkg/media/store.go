@@ -1,8 +1,8 @@
 // Package media applies partial updates to media documents in the shared "media"
 // collection. It is the concrete sink the workflow engine's ingest core injects
 // for the media-patch block kind: a stage that has enriched a recording (a
-// description, a star, extra tags) hands the change back and it lands here as an
-// org-scoped $set.
+// description, a star, extra tags) hands the change back and it lands here as a
+// tenant-scoped $set.
 //
 // It is the media-patch counterpart of the markers and detections packages. The
 // package deliberately does NOT import the ingest orchestrator — Store satisfies
@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/uug-ai/ingest/internal/projectfilter"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -29,7 +30,7 @@ const MediaCollection = "media"
 // timeout bounds each media update so a slow write cannot hold a queue worker.
 const timeout = 10 * time.Second
 
-// Store is the ingest media-patch sink: it adapts an org-scoped $set update to
+// Store is the ingest media-patch sink: it adapts a tenant-scoped $set update to
 // the ingest.MediaPatcher interface. It holds the Mongo database media documents
 // are stored in.
 type Store struct {
@@ -46,16 +47,27 @@ func NewStore(db *mongo.Database) *Store {
 }
 
 // PatchMedia applies fields ($set) to the media document identified within
-// organisationId by mediaId (its _id, when non-empty) or otherwise by mediaKey
-// (its recording key, media.videoFile). The update is always scoped to
-// organisationId so a stage can never patch a recording another organisation
-// owns, and it is idempotent (setting the same values again is a no-op). An empty
-// organisation, no usable identifier, an unparseable id, or unknown/foreign media
-// is a deterministic, non-retryable failure: none can be repaired by redelivery,
-// and reporting success would let the workflow advertise a patch that never
-// landed. It satisfies ingest.MediaPatcher so the orchestrator can use it as a
-// sink without importing this package's Mongo deps.
-func (s *Store) PatchMedia(ctx context.Context, organisationId, mediaId, mediaKey string, fields map[string]any) error {
+// organisationId (and, when set, projectId) by mediaId (its _id, when non-empty)
+// or otherwise by mediaKey (its recording key, media.videoFile). The update is
+// always scoped to organisationId so a stage can never patch a recording another
+// organisation owns, and it is idempotent (setting the same values again is a
+// no-op). An empty organisation, no usable identifier, an unparseable id, or
+// unknown/foreign media is a deterministic, non-retryable failure: none can be
+// repaired by redelivery, and reporting success would let the workflow advertise
+// a patch that never landed. It satisfies ingest.MediaPatcher so the orchestrator
+// can use it as a sink without importing this package's Mongo deps.
+//
+// projectId narrows the patch to a project inside that organisation. It is
+// tolerant of media stored before the project axis existed (see
+// internal/projectfilter): a strict clause would turn every pre-rollout
+// recording into a permanent "not found" and drop patches that are perfectly
+// valid. Unlike the organisation clause it is therefore not an isolation
+// boundary — the organisation clause already is one, and a project is a
+// subdivision inside it.
+//
+// The parameters stay primitives rather than a shared tenant struct because this
+// package must not import the ingest orchestrator (see the package doc).
+func (s *Store) PatchMedia(ctx context.Context, organisationId string, projectId *primitive.ObjectID, mediaId, mediaKey string, fields map[string]any) error {
 	if strings.TrimSpace(organisationId) == "" {
 		return permanentWriteError{err: errors.New("media-patch: organisation id is required")}
 	}
@@ -66,7 +78,7 @@ func (s *Store) PatchMedia(ctx context.Context, organisationId, mediaId, mediaKe
 	// mediaId (the _id) is the primary target; mediaKey (media.videoFile) is the
 	// fallback for a DB-free stage that only knows the recording key. Both paths
 	// stay scoped to organisationId so the org can never be escaped.
-	filter := bson.M{"organisationId": organisationId}
+	filter := projectfilter.Apply(bson.M{"organisationId": organisationId}, projectId)
 	target := strings.TrimSpace(mediaId)
 	switch {
 	case target != "":

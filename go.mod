@@ -3,7 +3,7 @@ module github.com/uug-ai/ingest
 go 1.25.8
 
 require (
-	github.com/uug-ai/models v1.7.10
+	github.com/uug-ai/models v1.7.16
 	github.com/uug-ai/trace v1.1.0
 	go.mongodb.org/mongo-driver v1.17.9
 )

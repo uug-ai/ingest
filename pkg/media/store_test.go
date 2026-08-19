@@ -41,7 +41,7 @@ func TestPatchMedia_RejectsEmptyOrganisation(t *testing.T) {
 	collection := &fakeMediaCollection{}
 	store := &Store{collection: collection}
 
-	err := store.PatchMedia(context.Background(), "  ", primitive.NewObjectID().Hex(), "", map[string]any{"star": true})
+	err := store.PatchMedia(context.Background(), "  ", nil, primitive.NewObjectID().Hex(), "", map[string]any{"star": true})
 	if !isPermanent(err) {
 		t.Fatalf("err = %v, want permanent failure", err)
 	}
@@ -55,7 +55,7 @@ func TestPatchMedia_UsesMandatoryOrganisationScope(t *testing.T) {
 	store := &Store{collection: collection}
 	id := primitive.NewObjectID()
 
-	err := store.PatchMedia(context.Background(), "org-1", id.Hex(), "", map[string]any{"star": true})
+	err := store.PatchMedia(context.Background(), "org-1", nil, id.Hex(), "", map[string]any{"star": true})
 	if err != nil {
 		t.Fatalf("PatchMedia: %v", err)
 	}
@@ -72,13 +72,48 @@ func TestPatchMedia_UsesMandatoryOrganisationScope(t *testing.T) {
 	if filter["organisationId"] != "org-1" {
 		t.Errorf("filter organisationId = %v, want org-1", filter["organisationId"])
 	}
+	if _, scoped := filter["projectId"]; scoped {
+		t.Error("a nil project must leave the patch organisation-wide, not add a projectId clause")
+	}
+}
+
+func TestPatchMedia_ScopesToProjectTolerantly(t *testing.T) {
+	collection := &fakeMediaCollection{result: &mongo.UpdateResult{MatchedCount: 1, ModifiedCount: 1}}
+	store := &Store{collection: collection}
+	projectId := primitive.NewObjectID()
+
+	err := store.PatchMedia(context.Background(), "org-1", &projectId, primitive.NewObjectID().Hex(), "", map[string]any{"star": true})
+	if err != nil {
+		t.Fatalf("PatchMedia: %v", err)
+	}
+	filter, ok := collection.filter.(bson.M)
+	if !ok {
+		t.Fatalf("filter type = %T, want bson.M", collection.filter)
+	}
+	predicate, ok := filter["projectId"].(bson.M)
+	if !ok {
+		t.Fatalf("filter projectId = %#v, want a bson.M predicate", filter["projectId"])
+	}
+	values, ok := predicate["$in"].(bson.A)
+	if !ok {
+		t.Fatalf("projectId predicate = %#v, want an $in", predicate)
+	}
+	// The null arm is what keeps media stored before the project axis existed
+	// patchable — without it every pre-rollout recording becomes a permanent
+	// "not found" and its patch is dropped rather than retried.
+	if len(values) != 2 || values[0] != projectId || values[1] != nil {
+		t.Errorf("projectId $in = %#v, want [%v <nil>]", values, projectId)
+	}
+	if filter["organisationId"] != "org-1" {
+		t.Errorf("filter organisationId = %v, want org-1 (the project narrows, it never replaces the org)", filter["organisationId"])
+	}
 }
 
 func TestPatchMedia_UnmatchedTargetIsPermanent(t *testing.T) {
 	collection := &fakeMediaCollection{result: &mongo.UpdateResult{MatchedCount: 0}}
 	store := &Store{collection: collection}
 
-	err := store.PatchMedia(context.Background(), "org-1", primitive.NewObjectID().Hex(), "", map[string]any{"star": true})
+	err := store.PatchMedia(context.Background(), "org-1", nil, primitive.NewObjectID().Hex(), "", map[string]any{"star": true})
 	if !isPermanent(err) {
 		t.Fatalf("err = %v, want permanent failure", err)
 	}
@@ -88,7 +123,7 @@ func TestPatchMedia_TransientWriteErrorRemainsRetryable(t *testing.T) {
 	collection := &fakeMediaCollection{err: errors.New("mongo unavailable")}
 	store := &Store{collection: collection}
 
-	err := store.PatchMedia(context.Background(), "org-1", primitive.NewObjectID().Hex(), "", map[string]any{"star": true})
+	err := store.PatchMedia(context.Background(), "org-1", nil, primitive.NewObjectID().Hex(), "", map[string]any{"star": true})
 	if err == nil {
 		t.Fatal("want write error")
 	}
@@ -101,7 +136,7 @@ func TestPatchMedia_FallsBackToKey(t *testing.T) {
 	collection := &fakeMediaCollection{result: &mongo.UpdateResult{MatchedCount: 1, ModifiedCount: 1}}
 	store := &Store{collection: collection}
 
-	err := store.PatchMedia(context.Background(), "org-1", "", "recording-key.mp4", map[string]any{"metadata.description": "Number plate detected: ABC123"})
+	err := store.PatchMedia(context.Background(), "org-1", nil, "", "recording-key.mp4", map[string]any{"metadata.description": "Number plate detected: ABC123"})
 	if err != nil {
 		t.Fatalf("PatchMedia: %v", err)
 	}
@@ -125,7 +160,7 @@ func TestPatchMedia_PrefersIdWhenBothSupplied(t *testing.T) {
 	store := &Store{collection: collection}
 	id := primitive.NewObjectID()
 
-	err := store.PatchMedia(context.Background(), "org-1", id.Hex(), "recording-key.mp4", map[string]any{"star": true})
+	err := store.PatchMedia(context.Background(), "org-1", nil, id.Hex(), "recording-key.mp4", map[string]any{"star": true})
 	if err != nil {
 		t.Fatalf("PatchMedia: %v", err)
 	}
@@ -145,7 +180,7 @@ func TestPatchMedia_RequiresAnIdentifier(t *testing.T) {
 	collection := &fakeMediaCollection{}
 	store := &Store{collection: collection}
 
-	err := store.PatchMedia(context.Background(), "org-1", "  ", "  ", map[string]any{"star": true})
+	err := store.PatchMedia(context.Background(), "org-1", nil, "  ", "  ", map[string]any{"star": true})
 	if !isPermanent(err) {
 		t.Fatalf("err = %v, want permanent failure when neither id nor key is supplied", err)
 	}

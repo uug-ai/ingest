@@ -27,6 +27,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+
+	"github.com/uug-ai/models/pkg/models"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
 // ErrUnknownKind is returned when an envelope carries a block whose type has no
@@ -96,11 +99,45 @@ type Target struct {
 	Key string
 	// OrganisationId scopes every write to the owning organisation.
 	OrganisationId string
+	// ProjectId places the write in a project within OrganisationId. It is
+	// optional: when nil the decoders derive the organisation's hidden default,
+	// so an adapter that has not resolved a project yet still stamps the value
+	// every project-scoped reader expects. Set it whenever the source media
+	// carries a stamped project, so an explicit assignment wins over the default.
+	ProjectId *primitive.ObjectID
 	// DeviceId is denormalised onto stored runs for filtering / cascade cleanup.
 	DeviceId string
 	// RecordingTimestamp (epoch seconds) is denormalised onto the run so cleanup
 	// expires it on the recording's retention clock, not the post time.
 	RecordingTimestamp int64
+}
+
+// resolveTargetProject returns the project that owns the resources derived from
+// a target: the target's explicit project when it carries one, otherwise the
+// hidden default for its organisation.
+//
+// The default is computed rather than looked up. models.DefaultProjectId is a
+// pure function of the organisation id, so every service that derives it agrees
+// without a query — no deployment ordering, no empty-collection edge case, no
+// chance of stamping a project the organisation's readers never select. That is
+// why this delegates to models.ResolveProjectId instead of reimplementing the
+// preference rule, and why it must never grow a database lookup.
+//
+// A non-ObjectID organisation yields nil rather than a guess. Stamping a
+// fabricated project would hide the resource from every project-scoped read,
+// which is strictly worse than leaving it organisation-wide and letting the
+// tolerant read predicates still resolve it.
+func resolveTargetProject(target Target) *primitive.ObjectID {
+	if target.ProjectId != nil && !target.ProjectId.IsZero() {
+		projectId := *target.ProjectId
+		return &projectId
+	}
+	organisationId, err := primitive.ObjectIDFromHex(target.OrganisationId)
+	if err != nil {
+		return nil
+	}
+	projectId := models.ResolveProjectId(organisationId, nil)
+	return &projectId
 }
 
 // Scope carries the per-request context shared by every action: the transport

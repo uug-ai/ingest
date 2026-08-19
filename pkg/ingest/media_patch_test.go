@@ -18,16 +18,17 @@ type fakeMediaPatcher struct {
 
 type mediaPatchCall struct {
 	organisationId string
+	projectId      *primitive.ObjectID
 	mediaId        string
 	mediaKey       string
 	fields         map[string]any
 }
 
-func (f *fakeMediaPatcher) PatchMedia(_ context.Context, organisationId, mediaId, mediaKey string, fields map[string]any) error {
+func (f *fakeMediaPatcher) PatchMedia(_ context.Context, organisationId string, projectId *primitive.ObjectID, mediaId, mediaKey string, fields map[string]any) error {
 	if f.err != nil {
 		return f.err
 	}
-	f.calls = append(f.calls, mediaPatchCall{organisationId: organisationId, mediaId: mediaId, mediaKey: mediaKey, fields: fields})
+	f.calls = append(f.calls, mediaPatchCall{organisationId: organisationId, projectId: projectId, mediaId: mediaId, mediaKey: mediaKey, fields: fields})
 	return nil
 }
 

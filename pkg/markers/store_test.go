@@ -11,6 +11,7 @@ import (
 	"github.com/uug-ai/ingest/pkg/ingest"
 	"github.com/uug-ai/models/pkg/models"
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
@@ -50,9 +51,11 @@ func TestMarkerWriterModes(t *testing.T) {
 	}()
 	db := client.Database(dbName)
 
+	projectId := primitive.NewObjectID()
 	marker := models.Marker{
 		Name:           "loitering-conformance",
 		OrganisationId: "org-1",
+		ProjectId:      &projectId,
 		DeviceId:       "device-1",
 		StartTimestamp: 1000,
 		EndTimestamp:   1010,
@@ -76,6 +79,20 @@ func TestMarkerWriterModes(t *testing.T) {
 		t.Errorf("option documents after two upserts = %d, want 1", got)
 	}
 
+	// The per-occurrence documents carry the project; the organisation's shared
+	// vocabulary deliberately does not (see the option-collection comment in
+	// mongodb.go — keying a dropdown by project would fragment it into identical
+	// copies and misrepresent a document genuinely shared across projects).
+	if got := count(t, ctx, db, MARKERS_COLLECTION, bson.M{"name": marker.Name, "projectId": projectId}); got != 1 {
+		t.Errorf("markers carrying the project = %d, want 1", got)
+	}
+	if got := count(t, ctx, db, MARKER_OPTION_RANGES_COLLECTION, bson.M{"value": marker.Name, "projectId": projectId}); got != 1 {
+		t.Errorf("ranges carrying the project = %d, want 1", got)
+	}
+	if got := count(t, ctx, db, MARKER_OPTIONS_COLLECTION, bson.M{"value": marker.Name, "projectId": bson.M{"$exists": true}}); got != 0 {
+		t.Errorf("option documents carrying a project = %d, want 0 (options are organisation vocabulary)", got)
+	}
+
 	// The insert path appends distinct markers, so two inserts on top of the one
 	// upserted marker leave three.
 	for i := 0; i < 2; i++ {
@@ -85,6 +102,67 @@ func TestMarkerWriterModes(t *testing.T) {
 	}
 	if got := count(t, ctx, db, MARKERS_COLLECTION, bson.M{"name": marker.Name}); got != 3 {
 		t.Errorf("marker documents after two inserts = %d, want 3", got)
+	}
+}
+
+// TestUpsertBackfillsPreRolloutMarker is the tolerant-predicate regression against
+// a real Mongo: a marker written before projectId existed must be refreshed and
+// back-filled by the same upsert that finds it, not duplicated beside it. A
+// strict projectId clause passes every other test in this file and fails here.
+func TestUpsertBackfillsPreRolloutMarker(t *testing.T) {
+	uri := os.Getenv("MARKERS_TEST_MONGO_URI")
+	if uri == "" {
+		t.Skip("set MARKERS_TEST_MONGO_URI to run the markers store integration test")
+	}
+
+	ctx := context.Background()
+	client, err := mongo.Connect(ctx, options.Client().ApplyURI(uri))
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = client.Disconnect(context.Background()) }()
+
+	dbName := fmt.Sprintf("markers_backfill_test_%d", time.Now().UnixNano())
+	origDB := DatabaseName
+	DatabaseName = dbName
+	defer func() {
+		DatabaseName = origDB
+		_ = client.Database(dbName).Drop(context.Background())
+	}()
+	db := client.Database(dbName)
+
+	projectId := primitive.NewObjectID()
+	marker := models.Marker{
+		Name:           "pre-rollout",
+		OrganisationId: "org-1",
+		DeviceId:       "device-1",
+		StartTimestamp: 1000,
+		EndTimestamp:   1010,
+	}
+
+	// First write with no project at all — the shape every marker had before this
+	// change.
+	if _, err := UpsertMarkerToMongodb(ctx, nil, client, marker); err != nil {
+		t.Fatalf("seed unprojected marker: %v", err)
+	}
+
+	// Now the same marker, stamped. It must land on the existing document.
+	marker.ProjectId = &projectId
+	if _, err := UpsertMarkerToMongodb(ctx, nil, client, marker); err != nil {
+		t.Fatalf("upsert projected marker: %v", err)
+	}
+
+	if got := count(t, ctx, db, MARKERS_COLLECTION, bson.M{"name": marker.Name}); got != 1 {
+		t.Errorf("marker documents = %d, want 1 (the stamped write must refresh the unstamped one)", got)
+	}
+	if got := count(t, ctx, db, MARKERS_COLLECTION, bson.M{"name": marker.Name, "projectId": projectId}); got != 1 {
+		t.Errorf("back-filled markers = %d, want 1", got)
+	}
+	if got := count(t, ctx, db, MARKER_OPTION_RANGES_COLLECTION, bson.M{"value": marker.Name}); got != 1 {
+		t.Errorf("range documents = %d, want 1 (the range must back-fill too, not duplicate)", got)
+	}
+	if got := count(t, ctx, db, MARKER_OPTION_RANGES_COLLECTION, bson.M{"value": marker.Name, "projectId": projectId}); got != 1 {
+		t.Errorf("back-filled ranges = %d, want 1", got)
 	}
 }
 
@@ -161,9 +239,11 @@ func TestMarkerSummaryEntry(t *testing.T) {
 // documents and returns no error, so the marker lands with its mediaKeys while
 // the media is never tagged. It needs no Mongo.
 func TestMediaLinkFilter(t *testing.T) {
+	projectId := primitive.NewObjectID()
 	marker := models.Marker{
 		DeviceId:       "device-key-1",
 		OrganisationId: "org-1",
+		ProjectId:      &projectId,
 	}
 	filter := mediaLinkFilter(marker, "org/recording.mp4")
 
@@ -184,10 +264,11 @@ func TestMediaLinkFilter(t *testing.T) {
 		}
 	}
 	assertDeviceScope(t, filter, "device-key-1")
+	assertProjectScope(t, filter, projectId)
 
 	t.Run("omits absent scopes", func(t *testing.T) {
 		bare := mediaLinkFilter(models.Marker{}, "org/recording.mp4")
-		for _, key := range []string{"$or", "organisationId"} {
+		for _, key := range []string{"$or", "organisationId", "projectId"} {
 			if _, present := bare[key]; present {
 				t.Errorf("expected %q to be omitted for a marker that carries no scope", key)
 			}
@@ -199,18 +280,41 @@ func TestMediaLinkFilter(t *testing.T) {
 // span. It shares the device predicate with the by-key path, so it carries the
 // same deviceKey correction.
 func TestMediaOverlapFilter(t *testing.T) {
+	projectId := primitive.NewObjectID()
 	filter := mediaOverlapFilter(models.Marker{
 		DeviceId:       "device-key-1",
+		ProjectId:      &projectId,
 		StartTimestamp: 1000,
 		EndTimestamp:   1010,
 	})
 
 	assertDeviceScope(t, filter, "device-key-1")
+	assertProjectScope(t, filter, projectId)
 	if start, _ := filter["startTimestamp"].(bson.M); start["$lte"] != int64(1010) {
 		t.Errorf("startTimestamp = %v, want $lte 1010", filter["startTimestamp"])
 	}
 	if end, _ := filter["endTimestamp"].(bson.M); end["$gte"] != int64(1000) {
 		t.Errorf("endTimestamp = %v, want $gte 1000", filter["endTimestamp"])
+	}
+}
+
+// assertProjectScope checks that a filter narrows to the project under its own
+// top-level key — so it never collides with the $or the device scope occupies —
+// and that it still resolves media stored before the project axis existed. A
+// strict equality here would silently tag nothing for every recording predating
+// the project stamp, which is a linkage regression no other test would catch.
+func assertProjectScope(t *testing.T, filter bson.M, projectId primitive.ObjectID) {
+	t.Helper()
+	predicate, ok := filter["projectId"].(bson.M)
+	if !ok {
+		t.Fatalf("projectId = %#v, want a bson.M predicate", filter["projectId"])
+	}
+	values, ok := predicate["$in"].(bson.A)
+	if !ok {
+		t.Fatalf("projectId predicate = %#v, want an $in", predicate)
+	}
+	if len(values) != 2 || values[0] != projectId || values[1] != nil {
+		t.Errorf("projectId $in = %#v, want [%v <nil>] (the null arm keeps unstamped media reachable)", values, projectId)
 	}
 }
 
