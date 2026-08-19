@@ -23,12 +23,17 @@ import (
 // that never landed.
 type MediaPatcher interface {
 	// PatchMedia applies fields ($set) to the media document identified within
-	// organisationId by mediaId (its _id) when non-empty, otherwise by mediaKey
-	// (its recording key). The decode step guarantees at least one identifier is
-	// non-empty and prefers the id. fields is keyed by the media document's own
-	// (dot-notation) field paths, already validated against the patchable allow
-	// list by the decode step.
-	PatchMedia(ctx context.Context, organisationId, mediaId, mediaKey string, fields map[string]any) error
+	// organisationId (and, when non-nil, projectId) by mediaId (its _id) when
+	// non-empty, otherwise by mediaKey (its recording key). The decode step
+	// guarantees at least one identifier is non-empty and prefers the id. fields
+	// is keyed by the media document's own (dot-notation) field paths, already
+	// validated against the patchable allow list by the decode step.
+	//
+	// projectId narrows the patch within the organisation. An implementation MUST
+	// still resolve media stored before the project axis existed (i.e. with no
+	// projectId of its own), so that a project clause never turns a valid patch
+	// into a "not found" for a legacy recording.
+	PatchMedia(ctx context.Context, organisationId string, projectId *primitive.ObjectID, mediaId, mediaKey string, fields map[string]any) error
 }
 
 // ErrMediaPatchValidation tags a non-retryable media-patch validation failure (a
@@ -54,8 +59,10 @@ const maxMediaPatchFields = 32
 // mediaPatchableFields is the allow-list of fields a media-patch block may set,
 // mapping the wire field name to the media document's own (dot-notation) bson
 // path. It is deliberately closed: identity and RBAC fields (_id, organisationId,
-// deviceId, siteId, groupId) are never patchable, so a block can never re-scope a
-// recording or overwrite its ownership. Add a new patchable field here.
+// projectId, deviceId, siteId, groupId) are never patchable, so a block can never
+// re-scope a recording or overwrite its ownership — the tenant placement is
+// derived server-side from the target, never taken from a payload. Add a new
+// patchable field here.
 var mediaPatchableFields = map[string]string{
 	"description": "metadata.description",
 	"star":        "star",
@@ -230,7 +237,9 @@ func (PatchMedia) Name() string { return "patch_media" }
 func (PatchMedia) RunFor(Source) bool { return true }
 
 // Apply implements Action: it applies the decoded patch. The MediaPatcher must be
-// wired by any transport that routes the media-patch kind.
+// wired by any transport that routes the media-patch kind. The tenant scope comes
+// from the target, never from the block — the allow-list above cannot express a
+// re-scope, and this is where that guarantee is enforced.
 func (PatchMedia) Apply(ctx context.Context, scope Scope, target Target, run any) error {
 	p, ok := run.(MediaPatch)
 	if !ok {
@@ -239,5 +248,5 @@ func (PatchMedia) Apply(ctx context.Context, scope Scope, target Target, run any
 	if scope.Media == nil {
 		return fmt.Errorf("%w: no MediaPatcher configured on scope", ErrPermanent)
 	}
-	return scope.Media.PatchMedia(ctx, target.OrganisationId, p.MediaId, p.MediaKey, p.Set)
+	return scope.Media.PatchMedia(ctx, target.OrganisationId, resolveTargetProject(target), p.MediaId, p.MediaKey, p.Set)
 }

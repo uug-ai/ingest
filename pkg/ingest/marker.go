@@ -53,10 +53,10 @@ func (d MarkerDetail) Summary() string {
 }
 
 // decodeMarker unmarshals the block payload into a models.Marker, stamps the
-// target-derived identity onto it (the wire never owns the organisation or the
-// document id), fills the derived duration, and validates the minimum a timeline
-// marker needs: a name and a start. It runs once per block; UpsertMarker
-// consumes its typed output.
+// target-derived identity onto it (the wire never owns the organisation, the
+// project or the document id), fills the derived duration, and validates the
+// minimum a timeline marker needs: a name and a start. It runs once per block;
+// UpsertMarker consumes its typed output.
 func decodeMarker(_ Scope, target Target, payload json.RawMessage) (any, Report, error) {
 	var m models.Marker
 	if err := json.Unmarshal(payload, &m); err != nil {
@@ -64,9 +64,17 @@ func decodeMarker(_ Scope, target Target, payload json.RawMessage) (any, Report,
 	}
 
 	// Server-owned identity: never trust the wire for these. The sink owns _id;
-	// the target owns the organisation and (when the wire omits it) the device.
+	// the target owns the organisation, the project and (when the wire omits it)
+	// the device.
+	//
+	// The project is assigned unconditionally, exactly like the organisation.
+	// models.Marker.ProjectId is json-decodable (`projectId,omitempty`), so a
+	// producer that sent one would otherwise place its marker in a project of
+	// its own choosing — the tenant placement is the server's to decide, not the
+	// payload's.
 	m.Id = primitive.NilObjectID
 	m.OrganisationId = target.OrganisationId
+	m.ProjectId = resolveTargetProject(target)
 	if strings.TrimSpace(m.DeviceId) == "" {
 		m.DeviceId = target.DeviceId
 	}

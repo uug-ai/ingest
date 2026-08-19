@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/uug-ai/ingest/internal/projectfilter"
 	"github.com/uug-ai/models/pkg/models"
 	"github.com/uug-ai/trace/pkg/opentelemetry"
 
@@ -76,16 +77,20 @@ func addMarker(ctxTracer context.Context, tracer *opentelemetry.Tracer, client *
 		// Upsert by stable identity so a redelivery refreshes the marker instead
 		// of inserting a duplicate. _id is owned by the first insert and never
 		// reassigned, so anything that linked to the marker survives the replay.
+		// The project predicate is tolerant of markers written before the field
+		// existed (see internal/projectfilter), and markerSetDoc carries projectId
+		// into the $set — so a matched legacy marker is refreshed and back-filled
+		// by this same operation rather than duplicated beside it.
 		set, err := markerSetDoc(marker)
 		if err != nil {
 			return models.Marker{}, err
 		}
-		filter := bson.M{
+		filter := projectfilter.Apply(bson.M{
 			"organisationId": marker.OrganisationId,
 			"deviceId":       marker.DeviceId,
 			"name":           marker.Name,
 			"startTimestamp": marker.StartTimestamp,
-		}
+		}, marker.ProjectId)
 		update := bson.M{
 			"$set":         set,
 			"$setOnInsert": bson.M{"_id": primitive.NewObjectID()},
@@ -129,6 +134,16 @@ func addMarker(ctxTracer context.Context, tracer *opentelemetry.Tracer, client *
 
 	// As part of the marker we also need to insert into some other collections for performance reasons.
 	// For example on the media page we have marker options, marker event options, marker tag options, marker category options.
+	//
+	// The four *_options collections below stay keyed by (value, organisationId)
+	// and carry no project. They are an organisation's vocabulary — "which marker
+	// names exist here", the source of the media page's filter dropdowns — not a
+	// per-project resource. Keying them by project would fragment every dropdown
+	// into per-project copies that are byte-identical while a project is still
+	// the organisation's default, and stamping a project onto a document several
+	// projects legitimately share would misrepresent it. The *_ranges documents
+	// below are the opposite case: one per occurrence, bound to a device and a
+	// time span, so they are project-scoped like the marker itself.
 
 	// Collections for tracking unique entries
 	nameSet := make(map[string]struct{})
@@ -178,7 +193,7 @@ func addMarker(ctxTracer context.Context, tracer *opentelemetry.Tracer, client *
 			up.SetUpsert(true)
 			markerOptUpserts = append(markerOptUpserts, up)
 		}
-		markerRangeDocs = append(markerRangeDocs, bson.M{
+		markerRangeDocs = append(markerRangeDocs, rangeDoc(bson.M{
 			"value":          marker.Name,
 			"text":           marker.Name,
 			"organisationId": marker.OrganisationId,
@@ -187,7 +202,7 @@ func addMarker(ctxTracer context.Context, tracer *opentelemetry.Tracer, client *
 			"deviceId":       marker.DeviceId,
 			"groupId":        marker.GroupId,
 			"createdAt":      now,
-		})
+		}, marker.ProjectId))
 	}
 
 	// tags
@@ -213,7 +228,7 @@ func addMarker(ctxTracer context.Context, tracer *opentelemetry.Tracer, client *
 			up.SetUpsert(true)
 			tagOptUpserts = append(tagOptUpserts, up)
 		}
-		tagRangeDocs = append(tagRangeDocs, bson.M{
+		tagRangeDocs = append(tagRangeDocs, rangeDoc(bson.M{
 			"value":          tag.Name,
 			"text":           tag.Name,
 			"organisationId": marker.OrganisationId,
@@ -222,7 +237,7 @@ func addMarker(ctxTracer context.Context, tracer *opentelemetry.Tracer, client *
 			"deviceId":       marker.DeviceId,
 			"groupId":        marker.GroupId,
 			"createdAt":      now,
-		})
+		}, marker.ProjectId))
 	}
 
 	// events
@@ -248,7 +263,7 @@ func addMarker(ctxTracer context.Context, tracer *opentelemetry.Tracer, client *
 			up.SetUpsert(true)
 			eventOptUpserts = append(eventOptUpserts, up)
 		}
-		eventRangeDocs = append(eventRangeDocs, bson.M{
+		eventRangeDocs = append(eventRangeDocs, rangeDoc(bson.M{
 			"value":          event.Name,
 			"text":           event.Name,
 			"organisationId": marker.OrganisationId,
@@ -258,7 +273,7 @@ func addMarker(ctxTracer context.Context, tracer *opentelemetry.Tracer, client *
 			"groupId":        marker.GroupId,
 			"createdAt":      now,
 			"updatedAt":      now,
-		})
+		}, marker.ProjectId))
 	}
 
 	// categories
@@ -460,12 +475,15 @@ func mediaDeviceScope(deviceKey string) []bson.M {
 // recording regardless of the marker's absolute timing, which is what makes this
 // path immune to the drift the overlap fallback suffers from.
 //
-// The device and organisation predicates are applied only when the marker
-// carries them, so a caller can only tag media it owns. The organisation
+// The device, organisation and project predicates are applied only when the
+// marker carries them, so a caller can only tag media it owns. The organisation
 // predicate needs media.organisationId to be populated — the monitor stage
 // stamps it (models.PipelineEvent.copyOwnershipToMedia) — so where ownership has
 // not been propagated yet this matches nothing by design rather than tagging
-// across tenants.
+// across tenants. The project predicate is the deliberate exception to that
+// stance: an unstamped media is *not* excluded by it, because a project is a
+// subdivision inside a boundary the organisation predicate already enforces, so
+// excluding on it would cost linkage without buying isolation.
 func mediaLinkFilter(marker models.Marker, key string) bson.M {
 	filter := bson.M{"videoFile": key}
 	if marker.DeviceId != "" {
@@ -474,17 +492,21 @@ func mediaLinkFilter(marker models.Marker, key string) bson.M {
 	if marker.OrganisationId != "" {
 		filter["organisationId"] = marker.OrganisationId
 	}
-	return filter
+	// The project predicate goes under its own top-level key, so it composes with
+	// the $or the device scope already occupies. It is tolerant of media stamped
+	// before the project axis existed — a strict match would silently tag nothing
+	// for every recording predating Monitor's project stamp.
+	return projectfilter.Apply(filter, marker.ProjectId)
 }
 
 // mediaOverlapFilter is the fallback for a marker that names no recording at
 // all: every media on the same device whose span overlaps the marker's.
 func mediaOverlapFilter(marker models.Marker) bson.M {
-	return bson.M{
+	return projectfilter.Apply(bson.M{
 		"$or":            mediaDeviceScope(marker.DeviceId),
 		"startTimestamp": bson.M{"$lte": marker.EndTimestamp},
 		"endTimestamp":   bson.M{"$gte": marker.StartTimestamp},
-	}
+	}, marker.ProjectId)
 }
 
 // markerDenormNames collects the unique, non-empty marker/tag/event/category names that
@@ -566,12 +588,32 @@ func markerSetDoc(m models.Marker) (bson.M, error) {
 	return doc, nil
 }
 
+// rangeDoc stamps the owning project onto a denormalised *_ranges document.
+//
+// A marker with no project leaves the field out entirely rather than writing an
+// explicit null, so a range written without a project is indistinguishable from
+// one written before the project axis existed — which is exactly what the
+// tolerant read predicate expects. The value is stored, not the pointer, so the
+// stored type matches what a project-scoped reader compares against.
+func rangeDoc(doc bson.M, projectId *primitive.ObjectID) bson.M {
+	if projectId != nil && !projectId.IsZero() {
+		doc["projectId"] = *projectId
+	}
+	return doc
+}
+
 // writeRanges persists the denormalised *_ranges documents. In insert mode it
 // appends them (the authoring path, where a marker is written once). In
 // idempotent mode it upserts each document keyed by its natural identity
-// (value, organisationId, deviceId, start, end) so a redelivery of the same
-// marker refreshes the range rather than duplicating it; createdAt is seeded
-// once on first insert.
+// (value, organisationId, projectId, deviceId, start, end) so a redelivery of
+// the same marker refreshes the range rather than duplicating it; createdAt is
+// seeded once on first insert.
+//
+// projectId is matched through the tolerant predicate but deliberately kept OUT
+// of the identity skip-list below, so it still flows into the $set. Mongo seeds
+// an upserted document only from a filter's equality clauses, and the project
+// predicate is an $in — leaving it in the $set is what both stamps a fresh
+// insert and back-fills a matched range that predates the field.
 func writeRanges(ctx context.Context, col *mongo.Collection, docs []any, idempotent bool) error {
 	if len(docs) == 0 {
 		return nil
@@ -597,6 +639,9 @@ func writeRanges(ctx context.Context, col *mongo.Collection, docs []any, idempot
 			"deviceId":       doc["deviceId"],
 			"start":          doc["start"],
 			"end":            doc["end"],
+		}
+		if projectId, ok := doc["projectId"].(primitive.ObjectID); ok {
+			projectfilter.Apply(filter, &projectId)
 		}
 
 		set := bson.M{}

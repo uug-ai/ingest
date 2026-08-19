@@ -132,8 +132,11 @@ func decodeDetection(scope Scope, target Target, payload json.RawMessage) (any, 
 
 	// Stamp the resolved recording identity (the producer never sends these;
 	// the adapter resolved them from mediaKey/analysisId or the event fileName).
+	// This has to run after Normalize: the task handler builds a fresh
+	// models.DetectionRun, so anything stamped before it is discarded.
 	run.Key = target.Key
 	run.OrganisationId = target.OrganisationId
+	run.ProjectId = resolveTargetProject(target)
 	run.DeviceId = target.DeviceId
 	run.RecordingTimestamp = target.RecordingTimestamp
 	if run.Task == "" {

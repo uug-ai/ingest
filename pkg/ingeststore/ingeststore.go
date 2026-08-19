@@ -22,8 +22,8 @@ import (
 
 // NewDetectionStore builds the Mongo detection-run sink (ingest.DetectionStore)
 // over the caller's database. It upserts each run by identity
-// (key, organisationId, source.runId) so an at-least-once redelivery refreshes
-// rather than duplicates it.
+// (key, organisationId, projectId, source.runId) so an at-least-once redelivery
+// refreshes rather than duplicates it.
 func NewDetectionStore(db *mongo.Database) ingest.DetectionStore {
 	return detections.NewStore(db)
 }
@@ -37,9 +37,9 @@ func NewMarkerStore(client *mongo.Client, tracer *opentelemetry.Tracer) ingest.M
 }
 
 // NewMediaStore builds the Mongo media-patch sink (ingest.MediaPatcher) over the
-// caller's database. It applies an org-scoped $set to the target media document,
-// so a media-patch block from a workflow stage enriches a recording without ever
-// crossing an organisation boundary.
+// caller's database. It applies an organisation- and project-scoped $set to the
+// target media document, so a media-patch block from a workflow stage enriches a
+// recording without ever crossing an organisation boundary.
 func NewMediaStore(db *mongo.Database) ingest.MediaPatcher {
 	return media.NewStore(db)
 }
