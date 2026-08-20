@@ -467,12 +467,7 @@ func addMarker(ctxTracer context.Context, tracer *opentelemetry.Tracer, client *
 			}
 			if len(update) > 0 {
 				mediaCol := db.Collection(MEDIA_COLLECTION)
-				filter := bson.M{
-					"_id":            mediaObjectId,
-					"startTimestamp": bson.M{"$lte": marker.EndTimestamp},
-					"endTimestamp":   bson.M{"$gte": marker.StartTimestamp},
-				}
-				if _, err := mediaCol.UpdateOne(ctx, filter, update); err != nil {
+				if _, err := mediaCol.UpdateOne(ctx, mediaIdFilter(marker, mediaObjectId), update); err != nil {
 					return marker, fmt.Errorf("failed to update media with marker data: %w", err)
 				}
 			}
@@ -568,9 +563,42 @@ func mediaLinkFilter(marker models.Marker, key string) bson.M {
 // mediaOverlapFilter is the fallback for a marker that names no recording at
 // all: every media on the same device whose span overlaps the marker's. The
 // device scope owns $or here too, so the project clause composes under $and.
+//
+// Unlike mediaLinkFilter the organisation clause is unconditional, because this
+// is the one media path with no pin on a specific document. There the key
+// (media.videoFile) identifies a single recording, so an absent organisation
+// still cannot spill; here the only bounds are a device key and a time window,
+// neither of which is tenant-scoped. Two organisations running the same camera
+// name — the pipeline fills DeviceId from media.DeviceKey, which is a label,
+// not an id — would otherwise tag each other's recordings.
+//
+// A marker with no organisation therefore matches nothing: media.organisationId
+// is `omitempty`, so no stored document carries "". That is the same fail-closed
+// stance mediaDeviceScope already takes for an empty device key, and it costs
+// only the linkage on media written before the monitor stage began stamping
+// ownership — the trade mediaLinkFilter's doc comment already spells out.
 func mediaOverlapFilter(marker models.Marker) bson.M {
 	return projectfilter.Apply(bson.M{
 		"$or":            mediaDeviceScope(marker.DeviceId),
+		"organisationId": marker.OrganisationId,
+		"startTimestamp": bson.M{"$lte": marker.EndTimestamp},
+		"endTimestamp":   bson.M{"$gte": marker.StartTimestamp},
+	}, marker.OrganisationId, marker.ProjectId)
+}
+
+// mediaIdFilter selects one media by its document id, for the branch where the
+// caller passed explicit mediaIds to AddMarkerToMongodb.
+//
+// Those ids arrive as a variadic argument on an exported API, so they are
+// caller-supplied and opaque — nothing upstream proves they belong to the
+// marker's tenant. An _id pins one document, but it pins whichever document the
+// caller named, which is exactly the shape ownership scoping exists to stop.
+// The tenant clauses are unconditional for the same reason as
+// mediaOverlapFilter: a marker with no organisation tags nothing.
+func mediaIdFilter(marker models.Marker, mediaObjectId primitive.ObjectID) bson.M {
+	return projectfilter.Apply(bson.M{
+		"_id":            mediaObjectId,
+		"organisationId": marker.OrganisationId,
 		"startTimestamp": bson.M{"$lte": marker.EndTimestamp},
 		"endTimestamp":   bson.M{"$gte": marker.StartTimestamp},
 	}, marker.OrganisationId, marker.ProjectId)

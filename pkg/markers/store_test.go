@@ -407,12 +407,63 @@ func TestMediaOverlapFilter(t *testing.T) {
 
 	assertDeviceScope(t, filter, "device-key-1")
 	assertTolerantProjectScope(t, filter, projectId)
+	if filter["organisationId"] != organisation.Hex() {
+		t.Errorf("organisationId = %v, want %v", filter["organisationId"], organisation.Hex())
+	}
 	if start, _ := filter["startTimestamp"].(bson.M); start["$lte"] != int64(1010) {
 		t.Errorf("startTimestamp = %v, want $lte 1010", filter["startTimestamp"])
 	}
 	if end, _ := filter["endTimestamp"].(bson.M); end["$gte"] != int64(1000) {
 		t.Errorf("endTimestamp = %v, want $gte 1000", filter["endTimestamp"])
 	}
+
+	// The organisation clause is unconditional here, unlike mediaLinkFilter: this
+	// path has no key pinning a single recording, so an absent organisation would
+	// leave a device key and a time window as the only bounds. Device keys are
+	// labels, not ids — two tenants can pick the same one. "" matches nothing
+	// because media.organisationId is omitempty, which is the intended
+	// fail-closed outcome, so this must not be relaxed to a conditional clause.
+	t.Run("a marker with no organisation tags nothing", func(t *testing.T) {
+		bare := mediaOverlapFilter(models.Marker{DeviceId: "device-key-1"})
+		if bare["organisationId"] != "" {
+			t.Errorf("organisationId = %#v, want the unmatchable empty string", bare["organisationId"])
+		}
+	})
+}
+
+// TestMediaIdFilter pins the explicit-id branch. mediaIds reach
+// AddMarkerToMongodb as a variadic argument on an exported API, so they are
+// caller-supplied: an _id alone pins whichever document the caller named, in
+// whichever tenant.
+func TestMediaIdFilter(t *testing.T) {
+	organisation := primitive.NewObjectID()
+	projectId := models.DefaultProjectId(organisation)
+	mediaId := primitive.NewObjectID()
+
+	filter := mediaIdFilter(models.Marker{
+		OrganisationId: organisation.Hex(),
+		ProjectId:      &projectId,
+		StartTimestamp: 1000,
+		EndTimestamp:   1010,
+	}, mediaId)
+
+	if filter["_id"] != mediaId {
+		t.Errorf("_id = %v, want %v", filter["_id"], mediaId)
+	}
+	if filter["organisationId"] != organisation.Hex() {
+		t.Errorf("organisationId = %v, want %v", filter["organisationId"], organisation.Hex())
+	}
+	assertTolerantProjectScope(t, filter, projectId)
+
+	t.Run("a real project does not adopt unstamped media", func(t *testing.T) {
+		realProject := primitive.NewObjectID()
+		filter := mediaIdFilter(models.Marker{
+			OrganisationId: organisation.Hex(),
+			ProjectId:      &realProject,
+		}, mediaId)
+
+		assertStrictProjectScope(t, filter, realProject)
+	})
 }
 
 // TestMarkerUpsertFilterKeepsBothAxes pins the composition on the upsert identity
