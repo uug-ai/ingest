@@ -5,6 +5,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/uug-ai/models/pkg/models"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -77,36 +78,90 @@ func TestPatchMedia_UsesMandatoryOrganisationScope(t *testing.T) {
 	}
 }
 
-func TestPatchMedia_ScopesToProjectTolerantly(t *testing.T) {
-	collection := &fakeMediaCollection{result: &mongo.UpdateResult{MatchedCount: 1, ModifiedCount: 1}}
-	store := &Store{collection: collection}
-	projectId := primitive.NewObjectID()
+func TestPatchMedia_ScopesToProject(t *testing.T) {
+	organisation := primitive.NewObjectID()
 
-	err := store.PatchMedia(context.Background(), "org-1", &projectId, primitive.NewObjectID().Hex(), "", map[string]any{"star": true})
-	if err != nil {
-		t.Fatalf("PatchMedia: %v", err)
+	t.Run("the default project still reaches unstamped media", func(t *testing.T) {
+		collection := &fakeMediaCollection{result: &mongo.UpdateResult{MatchedCount: 1, ModifiedCount: 1}}
+		store := &Store{collection: collection}
+		projectId := models.DefaultProjectId(organisation)
+
+		err := store.PatchMedia(context.Background(), organisation.Hex(), &projectId, primitive.NewObjectID().Hex(), "", map[string]any{"star": true})
+		if err != nil {
+			t.Fatalf("PatchMedia: %v", err)
+		}
+		filter, ok := collection.filter.(bson.M)
+		if !ok {
+			t.Fatalf("filter type = %T, want bson.M", collection.filter)
+		}
+		clause := projectClause(t, filter)
+		arms, ok := clause["$or"].([]bson.M)
+		if !ok {
+			t.Fatalf("project clause = %#v, want a tolerant $or for the default project", clause)
+		}
+		// The tolerant arm is what keeps media stored before the project axis
+		// existed patchable — without it every pre-rollout recording becomes a
+		// permanent "not found" and its patch is dropped rather than retried.
+		var matchesProject, matchesUnstamped bool
+		for _, arm := range arms {
+			switch value := arm["projectId"].(type) {
+			case primitive.ObjectID:
+				matchesProject = matchesProject || value == projectId
+			case nil:
+				matchesUnstamped = true
+			case bson.M:
+				if value["$exists"] == false {
+					matchesUnstamped = true
+				}
+			}
+		}
+		if !matchesProject || !matchesUnstamped {
+			t.Errorf("project clause = %#v, want arms for %v and for unstamped media", clause, projectId)
+		}
+		if filter["organisationId"] != organisation.Hex() {
+			t.Errorf("filter organisationId = %v, want %v (the project narrows, it never replaces the org)", filter["organisationId"], organisation.Hex())
+		}
+	})
+
+	t.Run("a real project does not reach unstamped media", func(t *testing.T) {
+		// Unstamped media belongs to the organisation's default project. An
+		// unconditionally tolerant clause would let a second project patch it —
+		// a cross-project write no test written during the rollout would catch.
+		collection := &fakeMediaCollection{result: &mongo.UpdateResult{MatchedCount: 1, ModifiedCount: 1}}
+		store := &Store{collection: collection}
+		projectId := primitive.NewObjectID()
+
+		err := store.PatchMedia(context.Background(), organisation.Hex(), &projectId, primitive.NewObjectID().Hex(), "", map[string]any{"star": true})
+		if err != nil {
+			t.Fatalf("PatchMedia: %v", err)
+		}
+		filter, ok := collection.filter.(bson.M)
+		if !ok {
+			t.Fatalf("filter type = %T, want bson.M", collection.filter)
+		}
+		clause := projectClause(t, filter)
+		if clause["projectId"] != projectId {
+			t.Errorf("project clause = %#v, want strict equality on %v", clause, projectId)
+		}
+		if _, tolerant := clause["$or"]; tolerant {
+			t.Errorf("project clause = %#v, want no tolerant arm for a non-default project", clause)
+		}
+	})
+}
+
+// projectClause returns the single project clause the media filter nests under
+// $and. The clause is composed there rather than merged in so it can carry its
+// own $or without colliding with anything else in the filter.
+func projectClause(t *testing.T, filter bson.M) bson.M {
+	t.Helper()
+	if _, merged := filter["projectId"]; merged {
+		t.Fatalf("filter = %#v, want the project clause under $and, not merged as a top-level key", filter)
 	}
-	filter, ok := collection.filter.(bson.M)
-	if !ok {
-		t.Fatalf("filter type = %T, want bson.M", collection.filter)
+	and, ok := filter["$and"].([]bson.M)
+	if !ok || len(and) != 1 {
+		t.Fatalf("$and = %#v, want exactly the project clause", filter["$and"])
 	}
-	predicate, ok := filter["projectId"].(bson.M)
-	if !ok {
-		t.Fatalf("filter projectId = %#v, want a bson.M predicate", filter["projectId"])
-	}
-	values, ok := predicate["$in"].(bson.A)
-	if !ok {
-		t.Fatalf("projectId predicate = %#v, want an $in", predicate)
-	}
-	// The null arm is what keeps media stored before the project axis existed
-	// patchable — without it every pre-rollout recording becomes a permanent
-	// "not found" and its patch is dropped rather than retried.
-	if len(values) != 2 || values[0] != projectId || values[1] != nil {
-		t.Errorf("projectId $in = %#v, want [%v <nil>]", values, projectId)
-	}
-	if filter["organisationId"] != "org-1" {
-		t.Errorf("filter organisationId = %v, want org-1 (the project narrows, it never replaces the org)", filter["organisationId"])
-	}
+	return and[0]
 }
 
 func TestPatchMedia_UnmatchedTargetIsPermanent(t *testing.T) {

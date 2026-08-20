@@ -121,20 +121,24 @@ func addMarker(ctxTracer context.Context, tracer *opentelemetry.Tracer, client *
 		// Upsert by stable identity so a redelivery refreshes the marker instead
 		// of inserting a duplicate. _id is owned by the first insert and never
 		// reassigned, so anything that linked to the marker survives the replay.
-		// The project predicate is tolerant of markers written before the field
-		// existed (see internal/projectfilter), and markerSetDoc carries projectId
-		// into the $set — so a matched legacy marker is refreshed and back-filled
-		// by this same operation rather than duplicated beside it.
+		// For the organisation's default project the predicate also matches
+		// markers written before the field existed, so a matched legacy marker is
+		// refreshed rather than duplicated beside a new one. That tolerance is
+		// deliberately limited to the default project (see
+		// models.ProjectScopeFilter): for a real project the clause is strict, so
+		// this upsert can never adopt another project's marker.
+		//
+		// Because the tolerant form is an $or, Mongo seeds an upserted document
+		// only from the filter's equality clauses and would NOT insert projectId
+		// itself. markerSetDoc carries it explicitly — models.Marker tags
+		// ProjectId `bson:"projectId,omitempty"` and addMarker has already
+		// resolved it — so a fresh insert is stamped and a matched legacy marker
+		// is back-filled by this same operation.
 		set, err := markerSetDoc(marker)
 		if err != nil {
 			return models.Marker{}, err
 		}
-		filter := projectfilter.Apply(bson.M{
-			"organisationId": marker.OrganisationId,
-			"deviceId":       marker.DeviceId,
-			"name":           marker.Name,
-			"startTimestamp": marker.StartTimestamp,
-		}, marker.ProjectId)
+		filter := markerUpsertFilter(marker)
 		update := bson.M{
 			"$set":         set,
 			"$setOnInsert": bson.M{"_id": primitive.NewObjectID()},
@@ -489,6 +493,22 @@ func addMarker(ctxTracer context.Context, tracer *opentelemetry.Tracer, client *
 	return marker, nil
 }
 
+// markerUpsertFilter is the marker's stable identity. It is a function rather
+// than an inline literal so the tenant scoping can be asserted without a
+// database — the project axis is the part worth pinning, since getting it wrong
+// changes which marker the upsert adopts without ever raising an error.
+//
+// The project clause composes under $and rather than being merged into this
+// map, so its own $or (the tolerant form) stays intact.
+func markerUpsertFilter(marker models.Marker) bson.M {
+	return projectfilter.Apply(bson.M{
+		"organisationId": marker.OrganisationId,
+		"deviceId":       marker.DeviceId,
+		"name":           marker.Name,
+		"startTimestamp": marker.StartTimestamp,
+	}, marker.OrganisationId, marker.ProjectId)
+}
+
 // mediaDeviceScope is the media-collection predicate that narrows a marker write
 // to the device the marker belongs to.
 //
@@ -525,9 +545,11 @@ func mediaDeviceScope(deviceKey string) []bson.M {
 // stamps it (models.PipelineEvent.copyOwnershipToMedia) — so where ownership has
 // not been propagated yet this matches nothing by design rather than tagging
 // across tenants. The project predicate is the deliberate exception to that
-// stance: an unstamped media is *not* excluded by it, because a project is a
-// subdivision inside a boundary the organisation predicate already enforces, so
-// excluding on it would cost linkage without buying isolation.
+// stance: for the organisation's default project an unstamped media is *not*
+// excluded, because a project is a subdivision inside a boundary the
+// organisation predicate already enforces, so excluding on it would cost
+// linkage without buying isolation. For a real project the clause IS strict —
+// an unstamped recording belongs to the default project, not to that one.
 func mediaLinkFilter(marker models.Marker, key string) bson.M {
 	filter := bson.M{"videoFile": key}
 	if marker.DeviceId != "" {
@@ -536,21 +558,22 @@ func mediaLinkFilter(marker models.Marker, key string) bson.M {
 	if marker.OrganisationId != "" {
 		filter["organisationId"] = marker.OrganisationId
 	}
-	// The project predicate goes under its own top-level key, so it composes with
-	// the $or the device scope already occupies. It is tolerant of media stamped
-	// before the project axis existed — a strict match would silently tag nothing
-	// for every recording predating Monitor's project stamp.
-	return projectfilter.Apply(filter, marker.ProjectId)
+	// The project clause composes under $and, never merged into this map: the
+	// device scope above already owns the top-level $or, and the tolerant project
+	// clause is an $or too — merging would drop one of the two and the query
+	// would silently stop matching on device.
+	return projectfilter.Apply(filter, marker.OrganisationId, marker.ProjectId)
 }
 
 // mediaOverlapFilter is the fallback for a marker that names no recording at
-// all: every media on the same device whose span overlaps the marker's.
+// all: every media on the same device whose span overlaps the marker's. The
+// device scope owns $or here too, so the project clause composes under $and.
 func mediaOverlapFilter(marker models.Marker) bson.M {
 	return projectfilter.Apply(bson.M{
 		"$or":            mediaDeviceScope(marker.DeviceId),
 		"startTimestamp": bson.M{"$lte": marker.EndTimestamp},
 		"endTimestamp":   bson.M{"$gte": marker.StartTimestamp},
-	}, marker.ProjectId)
+	}, marker.OrganisationId, marker.ProjectId)
 }
 
 // markerDenormNames collects the unique, non-empty marker/tag/event/category names that
@@ -653,11 +676,12 @@ func rangeDoc(doc bson.M, projectId *primitive.ObjectID) bson.M {
 // the same marker refreshes the range rather than duplicating it; createdAt is
 // seeded once on first insert.
 //
-// projectId is matched through the tolerant predicate but deliberately kept OUT
-// of the identity skip-list below, so it still flows into the $set. Mongo seeds
-// an upserted document only from a filter's equality clauses, and the project
-// predicate is an $in — leaving it in the $set is what both stamps a fresh
-// insert and back-fills a matched range that predates the field.
+// projectId is matched through the shared project clause but deliberately kept
+// OUT of the identity skip-list below, so it still flows into the $set. Mongo
+// seeds an upserted document only from a filter's equality clauses, and for the
+// organisation's default project the clause is an $or — leaving projectId in the
+// $set is what both stamps a fresh insert and back-fills a matched range that
+// predates the field.
 func writeRanges(ctx context.Context, col *mongo.Collection, docs []any, idempotent bool) error {
 	if len(docs) == 0 {
 		return nil
@@ -685,7 +709,11 @@ func writeRanges(ctx context.Context, col *mongo.Collection, docs []any, idempot
 			"end":            doc["end"],
 		}
 		if projectId, ok := doc["projectId"].(primitive.ObjectID); ok {
-			projectfilter.Apply(filter, &projectId)
+			// The organisation the range belongs to decides which shape the project
+			// clause takes (tolerant only for that organisation's default project),
+			// so it has to be read back out of the range document here.
+			organisationId, _ := doc["organisationId"].(string)
+			projectfilter.Apply(filter, organisationId, &projectId)
 		}
 
 		set := bson.M{}

@@ -57,13 +57,15 @@ func NewStore(db *mongo.Database) *Store {
 // a patch that never landed. It satisfies ingest.MediaPatcher so the orchestrator
 // can use it as a sink without importing this package's Mongo deps.
 //
-// projectId narrows the patch to a project inside that organisation. It is
-// tolerant of media stored before the project axis existed (see
-// internal/projectfilter): a strict clause would turn every pre-rollout
-// recording into a permanent "not found" and drop patches that are perfectly
-// valid. Unlike the organisation clause it is therefore not an isolation
-// boundary — the organisation clause already is one, and a project is a
-// subdivision inside it.
+// projectId narrows the patch to a project inside that organisation, through
+// the shared clause (models.ProjectScopeFilter, adapted by
+// internal/projectfilter). For the organisation's default project it also
+// matches media stored before the project axis existed: a strict clause there
+// would turn every pre-rollout recording into a permanent "not found" and drop
+// patches that are perfectly valid. For a real project it is strict — an
+// unstamped recording belongs to the default project, not to that one. Unlike
+// the organisation clause it is not an isolation boundary in either shape — the
+// organisation clause already is one, and a project is a subdivision inside it.
 //
 // The parameters stay primitives rather than a shared tenant struct because this
 // package must not import the ingest orchestrator (see the package doc).
@@ -78,7 +80,7 @@ func (s *Store) PatchMedia(ctx context.Context, organisationId string, projectId
 	// mediaId (the _id) is the primary target; mediaKey (media.videoFile) is the
 	// fallback for a DB-free stage that only knows the recording key. Both paths
 	// stay scoped to organisationId so the org can never be escaped.
-	filter := projectfilter.Apply(bson.M{"organisationId": organisationId}, projectId)
+	filter := projectfilter.Apply(bson.M{"organisationId": organisationId}, organisationId, projectId)
 	target := strings.TrimSpace(mediaId)
 	switch {
 	case target != "":
