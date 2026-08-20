@@ -44,10 +44,13 @@ func TestUpsertDetectionRunIsIdempotent(t *testing.T) {
 	defer func() { _ = db.Drop(context.Background()) }()
 
 	store := NewStore(db)
-	projectId := primitive.NewObjectID()
+	organisation := primitive.NewObjectID()
+	// The organisation's default project: the only project whose clause is
+	// tolerant of unstamped runs, which is what the seeded legacy run below needs.
+	projectId := models.DefaultProjectId(organisation)
 	run := models.DetectionRun{
 		Key:            "media-1",
-		OrganisationId: "org-1",
+		OrganisationId: organisation.Hex(),
 		ProjectId:      &projectId,
 	}
 	run.Source.RunId = "run-1"
@@ -87,33 +90,104 @@ func TestUpsertDetectionRunIsIdempotent(t *testing.T) {
 	}
 }
 
-// TestUpsertFilterScopesToProjectTolerantly pins the identity filter's tenant
-// axes without a database. The project arm must keep matching runs written
-// before the field existed: a strict clause would fail to find the writer's own
-// earlier document and insert a duplicate instead of refreshing it.
-func TestUpsertFilterScopesToProjectTolerantly(t *testing.T) {
-	projectId := primitive.NewObjectID()
-	run := models.DetectionRun{Key: "media-1", OrganisationId: "org-1", ProjectId: &projectId}
+// TestUpsertFilterScopesToProject pins the identity filter's tenant axes without
+// a database.
+//
+// The default-project arm must keep matching runs written before the field
+// existed: a strict clause there would fail to find the writer's own earlier
+// document and insert a duplicate instead of refreshing it. A NON-default
+// project must be strict — an unconditionally tolerant clause reads the same
+// today but would let a second project's upsert adopt an unstamped run that
+// belongs to the default project.
+func TestUpsertFilterScopesToProject(t *testing.T) {
+	organisation := primitive.NewObjectID()
+	defaultProject := models.DefaultProjectId(organisation)
+	run := models.DetectionRun{Key: "media-1", OrganisationId: organisation.Hex(), ProjectId: &defaultProject}
 	run.Source.RunId = "run-1"
 
 	filter := upsertFilter(run)
 
-	if filter["key"] != "media-1" || filter["organisationId"] != "org-1" || filter["source.runId"] != "run-1" {
+	if filter["key"] != "media-1" || filter["organisationId"] != organisation.Hex() || filter["source.runId"] != "run-1" {
 		t.Errorf("filter = %#v, want the (key, organisationId, source.runId) identity intact", filter)
 	}
-	predicate, ok := filter["projectId"].(bson.M)
-	if !ok {
-		t.Fatalf("projectId = %#v, want a bson.M predicate", filter["projectId"])
+	if _, merged := filter["projectId"]; merged {
+		t.Fatalf("filter = %#v, want the project clause under $and, not merged as a top-level key", filter)
 	}
-	values, ok := predicate["$in"].(bson.A)
-	if !ok || len(values) != 2 || values[0] != projectId || values[1] != nil {
-		t.Errorf("projectId predicate = %#v, want an $in of [%v <nil>]", predicate, projectId)
+	and, ok := filter["$and"].([]bson.M)
+	if !ok || len(and) != 1 {
+		t.Fatalf("$and = %#v, want exactly the project clause", filter["$and"])
+	}
+	arms, ok := and[0]["$or"].([]bson.M)
+	if !ok {
+		t.Fatalf("project clause = %#v, want a tolerant $or for the default project", and[0])
+	}
+	var matchesProject, matchesUnstamped bool
+	for _, arm := range arms {
+		switch value := arm["projectId"].(type) {
+		case primitive.ObjectID:
+			matchesProject = matchesProject || value == defaultProject
+		case nil:
+			matchesUnstamped = true
+		case bson.M:
+			if value["$exists"] == false {
+				matchesUnstamped = true
+			}
+		}
+	}
+	if !matchesProject || !matchesUnstamped {
+		t.Errorf("project clause = %#v, want arms for %v and for unstamped runs", and[0], defaultProject)
 	}
 
-	t.Run("an unprojected run stays organisation-wide", func(t *testing.T) {
-		bare := upsertFilter(models.DetectionRun{Key: "media-1", OrganisationId: "org-1"})
-		if _, scoped := bare["projectId"]; scoped {
-			t.Error("a run with no project must not gain a projectId clause")
+	t.Run("a real project matches only its own runs", func(t *testing.T) {
+		realProject := primitive.NewObjectID()
+		run := run
+		run.ProjectId = &realProject
+
+		and, ok := upsertFilter(run)["$and"].([]bson.M)
+		if !ok || len(and) != 1 {
+			t.Fatalf("$and = %#v, want exactly the project clause", and)
+		}
+		if and[0]["projectId"] != realProject {
+			t.Errorf("project clause = %#v, want strict equality on %v", and[0], realProject)
+		}
+		if _, tolerant := and[0]["$or"]; tolerant {
+			t.Error("a non-default project must not match unstamped runs: it would adopt " +
+				"a run that belongs to the organisation's default project")
 		}
 	})
+
+	t.Run("an unprojected run stays organisation-wide", func(t *testing.T) {
+		bare := upsertFilter(models.DetectionRun{Key: "media-1", OrganisationId: organisation.Hex()})
+		for _, key := range []string{"projectId", "$and"} {
+			if _, scoped := bare[key]; scoped {
+				t.Errorf("a run with no project must not gain a %q clause", key)
+			}
+		}
+	})
+}
+
+// TestUpsertSetCarriesProject pins the other half of the upsert. For the
+// organisation's default project the identity filter's project clause is an
+// $or, and Mongo seeds an upserted document only from a filter's *equality*
+// clauses — so the filter alone would insert a run with no projectId at all.
+// The $set is the run itself, and models.DetectionRun tags ProjectId
+// `bson:"projectId,omitempty"`, so a resolved project is what stamps a fresh
+// insert and back-fills a matched legacy run.
+func TestUpsertSetCarriesProject(t *testing.T) {
+	organisation := primitive.NewObjectID()
+	projectId := models.DefaultProjectId(organisation)
+	run := models.DetectionRun{Key: "media-1", OrganisationId: organisation.Hex(), ProjectId: &projectId}
+
+	raw, err := bson.Marshal(run)
+	if err != nil {
+		t.Fatalf("marshal run: %v", err)
+	}
+	var doc bson.M
+	if err := bson.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("unmarshal run: %v", err)
+	}
+	if got := doc["projectId"]; got != projectId {
+		t.Errorf("$set projectId = %v, want %v — without it an upsert under the "+
+			"tolerant $or clause inserts an unstamped run", got, projectId)
+	}
 }

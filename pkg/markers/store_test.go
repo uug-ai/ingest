@@ -51,10 +51,11 @@ func TestMarkerWriterModes(t *testing.T) {
 	}()
 	db := client.Database(dbName)
 
-	projectId := primitive.NewObjectID()
+	organisation := primitive.NewObjectID()
+	projectId := models.DefaultProjectId(organisation)
 	marker := models.Marker{
 		Name:           "loitering-conformance",
-		OrganisationId: "org-1",
+		OrganisationId: organisation.Hex(),
 		ProjectId:      &projectId,
 		DeviceId:       "device-1",
 		StartTimestamp: 1000,
@@ -105,10 +106,12 @@ func TestMarkerWriterModes(t *testing.T) {
 	}
 }
 
-// TestUpsertBackfillsPreRolloutMarker is the tolerant-predicate regression against
+// TestUpsertBackfillsPreRolloutMarker is the tolerant-clause regression against
 // a real Mongo: a marker written before projectId existed must be refreshed and
-// back-filled by the same upsert that finds it, not duplicated beside it. A
-// strict projectId clause passes every other test in this file and fails here.
+// back-filled by the same upsert that finds it, not duplicated beside it. It is
+// the organisation's DEFAULT project that owns such a marker, so that is the
+// project the upsert runs under — a clause that were strict even there passes
+// every other test in this file and fails this one.
 func TestUpsertBackfillsPreRolloutMarker(t *testing.T) {
 	uri := os.Getenv("MARKERS_TEST_MONGO_URI")
 	if uri == "" {
@@ -131,23 +134,40 @@ func TestUpsertBackfillsPreRolloutMarker(t *testing.T) {
 	}()
 	db := client.Database(dbName)
 
-	projectId := primitive.NewObjectID()
+	organisation := primitive.NewObjectID()
+	projectId := models.DefaultProjectId(organisation)
 	marker := models.Marker{
 		Name:           "pre-rollout",
-		OrganisationId: "org-1",
+		OrganisationId: organisation.Hex(),
 		DeviceId:       "device-1",
 		StartTimestamp: 1000,
 		EndTimestamp:   1010,
 	}
 
-	// First write with no project at all — the shape every marker had before this
-	// change.
-	if _, err := UpsertMarkerToMongodb(ctx, nil, client, marker); err != nil {
+	// Seed the marker and its range in the shape they had before projectId
+	// existed: no such field at all. The writer itself can no longer produce that
+	// shape (it defaults the project), so the legacy state is inserted directly.
+	if _, err := db.Collection(MARKERS_COLLECTION).InsertOne(ctx, bson.M{
+		"name":           marker.Name,
+		"organisationId": marker.OrganisationId,
+		"deviceId":       marker.DeviceId,
+		"startTimestamp": marker.StartTimestamp,
+		"endTimestamp":   marker.EndTimestamp,
+	}); err != nil {
 		t.Fatalf("seed unprojected marker: %v", err)
 	}
+	if _, err := db.Collection(MARKER_OPTION_RANGES_COLLECTION).InsertOne(ctx, bson.M{
+		"value":          marker.Name,
+		"organisationId": marker.OrganisationId,
+		"deviceId":       marker.DeviceId,
+		"start":          marker.StartTimestamp,
+		"end":            marker.EndTimestamp,
+	}); err != nil {
+		t.Fatalf("seed unprojected range: %v", err)
+	}
 
-	// Now the same marker, stamped. It must land on the existing document.
-	marker.ProjectId = &projectId
+	// Now the same marker through the writer, which stamps the organisation's
+	// default project. It must land on the existing documents.
 	if _, err := UpsertMarkerToMongodb(ctx, nil, client, marker); err != nil {
 		t.Fatalf("upsert projected marker: %v", err)
 	}
@@ -284,16 +304,46 @@ func TestResolveMarkerProject(t *testing.T) {
 	})
 }
 
+// TestMarkerSetDocCarriesProject pins what the upsert's $set must contain, and
+// it is load-bearing for the identity filter above rather than a tautology about
+// bson tags. For the organisation's default project the project clause is an
+// $or, and Mongo seeds an upserted document only from a filter's *equality*
+// clauses — so nothing in the filter would put projectId on a fresh insert. This
+// $set is the only thing that stamps it, and the only thing that back-fills a
+// matched legacy marker.
+func TestMarkerSetDocCarriesProject(t *testing.T) {
+	organisation := primitive.NewObjectID()
+	projectId := models.DefaultProjectId(organisation)
+
+	set, err := markerSetDoc(models.Marker{
+		Id:             primitive.NewObjectID(),
+		Name:           "loitering",
+		OrganisationId: organisation.Hex(),
+		ProjectId:      &projectId,
+	})
+	if err != nil {
+		t.Fatalf("markerSetDoc: %v", err)
+	}
+	if got := set["projectId"]; got != projectId {
+		t.Errorf("$set projectId = %v, want %v — without it an upsert under the "+
+			"tolerant $or clause inserts an unstamped marker", got, projectId)
+	}
+	if _, present := set["_id"]; present {
+		t.Error("$set must not carry _id: the first insert owns it")
+	}
+}
+
 // TestMediaLinkFilter pins the media-collection predicate used by the
 // authoritative by-key path. The regression it guards is a silent one: filtering
 // on media."deviceId" — a deprecated field no producer writes — matches zero
 // documents and returns no error, so the marker lands with its mediaKeys while
 // the media is never tagged. It needs no Mongo.
 func TestMediaLinkFilter(t *testing.T) {
-	projectId := primitive.NewObjectID()
+	organisation := primitive.NewObjectID()
+	projectId := models.DefaultProjectId(organisation)
 	marker := models.Marker{
 		DeviceId:       "device-key-1",
-		OrganisationId: "org-1",
+		OrganisationId: organisation.Hex(),
 		ProjectId:      &projectId,
 	}
 	filter := mediaLinkFilter(marker, "org/recording.mp4")
@@ -301,8 +351,8 @@ func TestMediaLinkFilter(t *testing.T) {
 	if filter["videoFile"] != "org/recording.mp4" {
 		t.Errorf("videoFile = %v, want org/recording.mp4", filter["videoFile"])
 	}
-	if filter["organisationId"] != "org-1" {
-		t.Errorf("organisationId = %v, want org-1", filter["organisationId"])
+	if filter["organisationId"] != organisation.Hex() {
+		t.Errorf("organisationId = %v, want %v", filter["organisationId"], organisation.Hex())
 	}
 	if _, present := filter["deviceId"]; present {
 		t.Error("device must not be matched on the top-level deprecated deviceId field")
@@ -315,11 +365,25 @@ func TestMediaLinkFilter(t *testing.T) {
 		}
 	}
 	assertDeviceScope(t, filter, "device-key-1")
-	assertProjectScope(t, filter, projectId)
+	assertTolerantProjectScope(t, filter, projectId)
+
+	t.Run("a real project does not tag unstamped media", func(t *testing.T) {
+		// The leak this refactor closes: with an unconditionally tolerant clause a
+		// second project's marker would tag every unstamped recording in the
+		// organisation.
+		realProject := primitive.NewObjectID()
+		marker := marker
+		marker.ProjectId = &realProject
+
+		filter := mediaLinkFilter(marker, "org/recording.mp4")
+
+		assertDeviceScope(t, filter, "device-key-1")
+		assertStrictProjectScope(t, filter, realProject)
+	})
 
 	t.Run("omits absent scopes", func(t *testing.T) {
 		bare := mediaLinkFilter(models.Marker{}, "org/recording.mp4")
-		for _, key := range []string{"$or", "organisationId", "projectId"} {
+		for _, key := range []string{"$or", "$and", "organisationId", "projectId"} {
 			if _, present := bare[key]; present {
 				t.Errorf("expected %q to be omitted for a marker that carries no scope", key)
 			}
@@ -331,16 +395,18 @@ func TestMediaLinkFilter(t *testing.T) {
 // span. It shares the device predicate with the by-key path, so it carries the
 // same deviceKey correction.
 func TestMediaOverlapFilter(t *testing.T) {
-	projectId := primitive.NewObjectID()
+	organisation := primitive.NewObjectID()
+	projectId := models.DefaultProjectId(organisation)
 	filter := mediaOverlapFilter(models.Marker{
 		DeviceId:       "device-key-1",
+		OrganisationId: organisation.Hex(),
 		ProjectId:      &projectId,
 		StartTimestamp: 1000,
 		EndTimestamp:   1010,
 	})
 
 	assertDeviceScope(t, filter, "device-key-1")
-	assertProjectScope(t, filter, projectId)
+	assertTolerantProjectScope(t, filter, projectId)
 	if start, _ := filter["startTimestamp"].(bson.M); start["$lte"] != int64(1010) {
 		t.Errorf("startTimestamp = %v, want $lte 1010", filter["startTimestamp"])
 	}
@@ -349,23 +415,87 @@ func TestMediaOverlapFilter(t *testing.T) {
 	}
 }
 
-// assertProjectScope checks that a filter narrows to the project under its own
-// top-level key — so it never collides with the $or the device scope occupies —
-// and that it still resolves media stored before the project axis existed. A
-// strict equality here would silently tag nothing for every recording predating
-// the project stamp, which is a linkage regression no other test would catch.
-func assertProjectScope(t *testing.T, filter bson.M, projectId primitive.ObjectID) {
+// TestMarkerUpsertFilterKeepsBothAxes pins the composition on the upsert identity
+// filter, where getting it wrong is worst: a project clause merged over another
+// operator would change which marker the upsert adopts, silently.
+func TestMarkerUpsertFilterKeepsBothAxes(t *testing.T) {
+	organisation := primitive.NewObjectID()
+	projectId := models.DefaultProjectId(organisation)
+
+	filter := markerUpsertFilter(models.Marker{
+		OrganisationId: organisation.Hex(),
+		DeviceId:       "device-1",
+		Name:           "loitering",
+		StartTimestamp: 1000,
+		ProjectId:      &projectId,
+	})
+
+	if filter["organisationId"] != organisation.Hex() || filter["deviceId"] != "device-1" ||
+		filter["name"] != "loitering" || filter["startTimestamp"] != int64(1000) {
+		t.Errorf("filter = %#v, want the (organisation, device, name, start) identity intact", filter)
+	}
+	assertTolerantProjectScope(t, filter, projectId)
+}
+
+// projectClause returns the single project clause Apply nested under $and.
+func projectClause(t *testing.T, filter bson.M) bson.M {
 	t.Helper()
-	predicate, ok := filter["projectId"].(bson.M)
-	if !ok {
-		t.Fatalf("projectId = %#v, want a bson.M predicate", filter["projectId"])
+	if _, merged := filter["projectId"]; merged {
+		t.Fatalf("filter = %#v, want the project clause under $and, not merged as a top-level key", filter)
 	}
-	values, ok := predicate["$in"].(bson.A)
-	if !ok {
-		t.Fatalf("projectId predicate = %#v, want an $in", predicate)
+	and, ok := filter["$and"].([]bson.M)
+	if !ok || len(and) != 1 {
+		t.Fatalf("$and = %#v, want exactly the project clause", filter["$and"])
 	}
-	if len(values) != 2 || values[0] != projectId || values[1] != nil {
-		t.Errorf("projectId $in = %#v, want [%v <nil>] (the null arm keeps unstamped media reachable)", values, projectId)
+	return and[0]
+}
+
+// assertTolerantProjectScope checks that a filter narrows to the organisation's
+// DEFAULT project while still resolving media stored before the project axis
+// existed. A strict clause here would silently tag nothing for every recording
+// predating the project stamp, which is a linkage regression no other test would
+// catch. The clause lives under $and so it never collides with the $or the
+// device scope occupies.
+func assertTolerantProjectScope(t *testing.T, filter bson.M, projectId primitive.ObjectID) {
+	t.Helper()
+	clause := projectClause(t, filter)
+	arms, ok := clause["$or"].([]bson.M)
+	if !ok {
+		t.Fatalf("project clause = %#v, want a tolerant $or for the default project", clause)
+	}
+	var matchesProject, matchesUnstamped bool
+	for _, arm := range arms {
+		switch value := arm["projectId"].(type) {
+		case primitive.ObjectID:
+			matchesProject = matchesProject || value == projectId
+		case nil:
+			matchesUnstamped = true
+		case bson.M:
+			if value["$exists"] == false {
+				matchesUnstamped = true
+			}
+		}
+	}
+	if !matchesProject {
+		t.Errorf("project clause = %#v, want an arm matching %v", clause, projectId)
+	}
+	if !matchesUnstamped {
+		t.Errorf("project clause = %#v, want an arm matching unstamped documents", clause)
+	}
+}
+
+// assertStrictProjectScope is the counterpart: a project that is NOT its
+// organisation's default must match only what is stamped for it. A tolerant
+// clause here would reach every unstamped document in the organisation — the
+// cross-project leak the previous unconditional predicate carried.
+func assertStrictProjectScope(t *testing.T, filter bson.M, projectId primitive.ObjectID) {
+	t.Helper()
+	clause := projectClause(t, filter)
+	if got := clause["projectId"]; got != projectId {
+		t.Errorf("project clause = %#v, want strict equality on %v", clause, projectId)
+	}
+	if _, tolerant := clause["$or"]; tolerant {
+		t.Errorf("project clause = %#v, want no tolerant arm for a non-default project", clause)
 	}
 }
 

@@ -47,10 +47,15 @@ func NewStore(db *mongo.Database) *Store {
 // overwritten on replace. It satisfies ingest.DetectionStore so the orchestrator
 // can use it as a sink without importing this package's Mongo deps.
 //
-// The project predicate is tolerant of runs written before the field existed
-// (see internal/projectfilter), and $set carries the stamped projectId — so a
-// matched legacy run is refreshed and back-filled by this same operation rather
-// than duplicated beside it.
+// The project clause is the shared one (models.ProjectScopeFilter, adapted by
+// internal/projectfilter): tolerant of runs written before the field existed
+// only when the run belongs to its organisation's default project, and strict
+// for a real project so this upsert can never adopt another project's run.
+// $set carries the stamped projectId explicitly — models.DetectionRun tags
+// ProjectId `bson:"projectId,omitempty"`, and it must be carried because the
+// tolerant clause is an $or, which Mongo does not seed an upserted document
+// from. A matched legacy run is therefore refreshed and back-filled by this
+// same operation rather than duplicated beside it.
 func (s *Store) UpsertDetectionRun(ctx context.Context, run models.DetectionRun) error {
 	coll := s.db.Collection(DetectionsCollection)
 	now := time.Now().UnixMilli()
@@ -79,11 +84,13 @@ func (s *Store) UpsertDetectionRun(ctx context.Context, run models.DetectionRun)
 }
 
 // upsertFilter is the run's stable identity. It is a function rather than an
-// inline literal so the tenant scoping can be asserted without a database.
+// inline literal so the tenant scoping can be asserted without a database. The
+// project clause composes under $and rather than merging into this map, so it
+// can carry its own $or without colliding with anything the identity uses.
 func upsertFilter(run models.DetectionRun) bson.M {
 	return projectfilter.Apply(bson.M{
 		"key":            run.Key,
 		"organisationId": run.OrganisationId,
 		"source.runId":   run.Source.RunId,
-	}, run.ProjectId)
+	}, run.OrganisationId, run.ProjectId)
 }
