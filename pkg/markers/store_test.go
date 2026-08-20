@@ -233,6 +233,57 @@ func TestMarkerSummaryEntry(t *testing.T) {
 	})
 }
 
+// TestResolveMarkerProject pins the writer's tenancy defaulting. It is the rule
+// that lets a door which never resolved a project still store a project-scoped
+// marker, so the regression it guards is an invisible one: a nil here writes a
+// marker that is correct in every field a test usually asserts, yet vanishes
+// from every project-scoped read. It needs no Mongo.
+func TestResolveMarkerProject(t *testing.T) {
+	organisationId := primitive.NewObjectID()
+
+	t.Run("explicit assignment wins", func(t *testing.T) {
+		projectId := primitive.NewObjectID()
+		got := resolveMarkerProject(models.Marker{
+			OrganisationId: organisationId.Hex(),
+			ProjectId:      &projectId,
+		})
+		if got == nil || *got != projectId {
+			t.Fatalf("resolveMarkerProject = %v, want the caller's %v", got, projectId)
+		}
+	})
+
+	t.Run("unassigned falls back to the organisation default", func(t *testing.T) {
+		want := models.DefaultProjectId(organisationId)
+		got := resolveMarkerProject(models.Marker{OrganisationId: organisationId.Hex()})
+		if got == nil || *got != want {
+			t.Fatalf("resolveMarkerProject = %v, want the default %v", got, want)
+		}
+	})
+
+	t.Run("zero is unassigned, not a project", func(t *testing.T) {
+		// A zero ObjectID means "nobody filled this in". Honouring it would stamp
+		// NilObjectID onto the marker and hide it from every project-scoped read.
+		zero := primitive.NilObjectID
+		want := models.DefaultProjectId(organisationId)
+		got := resolveMarkerProject(models.Marker{
+			OrganisationId: organisationId.Hex(),
+			ProjectId:      &zero,
+		})
+		if got == nil || *got != want {
+			t.Fatalf("resolveMarkerProject = %v, want the default %v", got, want)
+		}
+	})
+
+	t.Run("non-ObjectID organisation degrades to nil", func(t *testing.T) {
+		// Guessing would be worse than not stamping: an organisation-wide marker
+		// is still resolved by the tolerant read predicates, a fabricated one is
+		// not resolved by anything.
+		if got := resolveMarkerProject(models.Marker{OrganisationId: "org-1"}); got != nil {
+			t.Fatalf("resolveMarkerProject = %v, want nil for a non-ObjectID organisation", got)
+		}
+	})
+}
+
 // TestMediaLinkFilter pins the media-collection predicate used by the
 // authoritative by-key path. The regression it guards is a silent one: filtering
 // on media."deviceId" — a deprecated field no producer writes — matches zero
