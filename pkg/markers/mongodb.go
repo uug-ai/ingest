@@ -48,13 +48,57 @@ func UpsertMarkerToMongodb(ctxTracer context.Context, tracer *opentelemetry.Trac
 	return addMarker(ctxTracer, tracer, client, marker, true, mediaIds...)
 }
 
+// resolveMarkerProject returns the project that owns a marker: the caller's
+// explicit assignment when it carries one, otherwise the hidden default for the
+// marker's organisation.
+//
+// Defaulting lives here, in the shared writer, rather than at each door. Every
+// producer of a marker writes through this package — the media UI (hub-api), the
+// analysers, the alert pipelines and the ingest core — so a door that has not
+// resolved a project still stores a project-scoped marker instead of one that
+// disappears from every project-scoped read. A door that knows better still
+// wins: an explicit non-zero value is left untouched.
+//
+// The default is computed, never looked up. models.DefaultProjectId is a pure
+// function of the organisation id, so every service agrees without a query and
+// this writer stays free of a project read. Do not "improve" it with one.
+//
+// What this deliberately does NOT do is decide whether the supplied project may
+// be trusted. This writer receives a models.Marker and cannot tell a value that
+// arrived on an HTTP body from one an analyser computed; only the door that
+// touched the untrusted bytes knows that. So each door still clears the field
+// before calling (ingest's decodeMarker, hub-api's AddMarker) — this fills the
+// gap, it does not close the trust boundary.
+//
+// A non-ObjectID organisation yields nil rather than a guess: stamping a
+// fabricated project would hide the marker from every project-scoped read,
+// which is strictly worse than leaving it organisation-wide where the tolerant
+// read predicates still resolve it.
+func resolveMarkerProject(marker models.Marker) *primitive.ObjectID {
+	if marker.ProjectId != nil && !marker.ProjectId.IsZero() {
+		return marker.ProjectId
+	}
+	organisationId, err := primitive.ObjectIDFromHex(marker.OrganisationId)
+	if err != nil {
+		return nil
+	}
+	projectId := models.ResolveProjectId(organisationId, nil)
+	return &projectId
+}
+
 // addMarker is the shared writer behind the insert and upsert entry points. The
 // only behaviour that differs between the two modes is how the marker document
 // and its *_ranges documents are written: the insert mode appends fresh
 // documents, the idempotent mode keys them so a replay refreshes in place. The
 // option/tag/event/category lookups and the media tagging are already idempotent
 // keyed upserts in both modes.
+//
+// Both modes first resolve the owning project (see resolveMarkerProject), so the
+// stored marker, its denormalised range documents and every filter below carry
+// the same tenant placement.
 func addMarker(ctxTracer context.Context, tracer *opentelemetry.Tracer, client *mongo.Client, marker models.Marker, idempotent bool, mediaIds ...string) (models.Marker, error) {
+
+	marker.ProjectId = resolveMarkerProject(marker)
 
 	// The tracer is optional: the ingest core has no per-result tracer to thread,
 	// and the marker write was untraced before this writer existed. Skip the span

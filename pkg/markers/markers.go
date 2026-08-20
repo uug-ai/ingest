@@ -16,6 +16,12 @@
 //     is at-least-once: a redelivery or a re-analysis of the same recording must
 //     refresh the marker, not duplicate it.
 //
+// The writer owns tenant placement defaulting: a marker whose ProjectId the
+// caller left unset is stored under its organisation's hidden default project
+// rather than project-less, so a door that has not yet resolved a project still
+// produces a marker its project-scoped reads can find. It does not own the trust
+// decision — see resolveMarkerProject in mongodb.go.
+//
 // The package deliberately does NOT import the ingest orchestrator. Store
 // satisfies ingest.MarkerStore structurally, so the orchestrator can stay
 // infra-free while the engine injects this concrete writer as its marker sink.
