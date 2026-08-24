@@ -60,6 +60,9 @@ func TestMarkerWriterModes(t *testing.T) {
 		DeviceId:       "device-1",
 		StartTimestamp: 1000,
 		EndTimestamp:   1010,
+		Tags:           []models.MarkerTag{{Name: "review"}},
+		Events:         []models.MarkerEvent{{Name: "motion", StartTimestamp: 1000, EndTimestamp: 1010}},
+		Categories:     []models.MarkerCategory{{Name: "security"}},
 	}
 
 	// Upsert the same marker twice: identity keying collapses the two writes into
@@ -80,18 +83,25 @@ func TestMarkerWriterModes(t *testing.T) {
 		t.Errorf("option documents after two upserts = %d, want 1", got)
 	}
 
-	// The per-occurrence documents carry the project; the organisation's shared
-	// vocabulary deliberately does not (see the option-collection comment in
-	// mongodb.go — keying a dropdown by project would fragment it into identical
-	// copies and misrepresent a document genuinely shared across projects).
+	// The marker, per-occurrence ranges and all option vocabularies carry the
+	// same project so project-scoped readers cannot expose another project's
+	// dropdown values.
 	if got := count(t, ctx, db, MARKERS_COLLECTION, bson.M{"name": marker.Name, "projectId": projectId}); got != 1 {
 		t.Errorf("markers carrying the project = %d, want 1", got)
 	}
 	if got := count(t, ctx, db, MARKER_OPTION_RANGES_COLLECTION, bson.M{"value": marker.Name, "projectId": projectId}); got != 1 {
 		t.Errorf("ranges carrying the project = %d, want 1", got)
 	}
-	if got := count(t, ctx, db, MARKER_OPTIONS_COLLECTION, bson.M{"value": marker.Name, "projectId": bson.M{"$exists": true}}); got != 0 {
-		t.Errorf("option documents carrying a project = %d, want 0 (options are organisation vocabulary)", got)
+	optionValues := map[string]string{
+		MARKER_OPTIONS_COLLECTION:          marker.Name,
+		MARKER_TAG_OPTIONS_COLLECTION:      "review",
+		MARKER_EVENT_OPTIONS_COLLECTION:    "motion",
+		MARKER_CATEGORY_OPTIONS_COLLECTION: "security",
+	}
+	for collection, value := range optionValues {
+		if got := count(t, ctx, db, collection, bson.M{"value": value, "projectId": projectId}); got != 1 {
+			t.Errorf("%s options carrying the project = %d, want 1", collection, got)
+		}
 	}
 
 	// The insert path appends distinct markers, so two inserts on top of the one
@@ -302,6 +312,30 @@ func TestResolveMarkerProject(t *testing.T) {
 			t.Fatalf("resolveMarkerProject = %v, want nil for a non-ObjectID organisation", got)
 		}
 	})
+}
+
+func TestOptionUpsertCarriesProjectScope(t *testing.T) {
+	organisation := primitive.NewObjectID()
+	projectId := models.DefaultProjectId(organisation)
+	marker := models.Marker{
+		OrganisationId: organisation.Hex(),
+		ProjectId:      &projectId,
+	}
+
+	filter := optionUpsertFilter(marker, "motion")
+	if filter["value"] != "motion" || filter["organisationId"] != organisation.Hex() {
+		t.Fatalf("option filter = %#v, want value and organisation identity", filter)
+	}
+	assertTolerantProjectScope(t, filter, projectId)
+
+	set := optionSetDoc(1234, &projectId)
+	if set["updatedAt"] != int64(1234) || set["projectId"] != projectId {
+		t.Errorf("option $set = %#v, want updatedAt and projectId", set)
+	}
+
+	realProject := primitive.NewObjectID()
+	marker.ProjectId = &realProject
+	assertStrictProjectScope(t, optionUpsertFilter(marker, "motion"), realProject)
 }
 
 // TestMarkerSetDocCarriesProject pins what the upsert's $set must contain, and
