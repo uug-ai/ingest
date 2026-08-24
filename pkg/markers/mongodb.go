@@ -86,6 +86,21 @@ func resolveMarkerProject(marker models.Marker) *primitive.ObjectID {
 	return &projectId
 }
 
+func optionUpsertFilter(marker models.Marker, value string) bson.M {
+	return projectfilter.Apply(bson.M{
+		"value":          value,
+		"organisationId": marker.OrganisationId,
+	}, marker.OrganisationId, marker.ProjectId)
+}
+
+func optionSetDoc(now int64, projectId *primitive.ObjectID) bson.M {
+	set := bson.M{"updatedAt": now}
+	if projectId != nil && !projectId.IsZero() {
+		set["projectId"] = *projectId
+	}
+	return set
+}
+
 // addMarker is the shared writer behind the insert and upsert entry points. The
 // only behaviour that differs between the two modes is how the marker document
 // and its *_ranges documents are written: the insert mode appends fresh
@@ -94,8 +109,8 @@ func resolveMarkerProject(marker models.Marker) *primitive.ObjectID {
 // keyed upserts in both modes.
 //
 // Both modes first resolve the owning project (see resolveMarkerProject), so the
-// stored marker, its denormalised range documents and every filter below carry
-// the same tenant placement.
+// stored marker, its denormalised option/range documents and every filter below
+// carry the same tenant placement.
 func addMarker(ctxTracer context.Context, tracer *opentelemetry.Tracer, client *mongo.Client, marker models.Marker, idempotent bool, mediaIds ...string) (models.Marker, error) {
 
 	marker.ProjectId = resolveMarkerProject(marker)
@@ -183,15 +198,10 @@ func addMarker(ctxTracer context.Context, tracer *opentelemetry.Tracer, client *
 	// As part of the marker we also need to insert into some other collections for performance reasons.
 	// For example on the media page we have marker options, marker event options, marker tag options, marker category options.
 	//
-	// The four *_options collections below stay keyed by (value, organisationId)
-	// and carry no project. They are an organisation's vocabulary — "which marker
-	// names exist here", the source of the media page's filter dropdowns — not a
-	// per-project resource. Keying them by project would fragment every dropdown
-	// into per-project copies that are byte-identical while a project is still
-	// the organisation's default, and stamping a project onto a document several
-	// projects legitimately share would misrepresent it. The *_ranges documents
-	// below are the opposite case: one per occurrence, bound to a device and a
-	// time span, so they are project-scoped like the marker itself.
+	// Options are project-owned vocabulary: the same value may exist independently
+	// in two projects, and each project's dropdown must only expose its own values.
+	// The default-project predicate also adopts and backfills legacy unstamped
+	// options instead of creating duplicates during rollout.
 
 	// Collections for tracking unique entries
 	nameSet := make(map[string]struct{})
@@ -223,7 +233,7 @@ func addMarker(ctxTracer context.Context, tracer *opentelemetry.Tracer, client *
 				}
 			}
 			up := mongo.NewUpdateOneModel()
-			up.SetFilter(bson.M{"value": marker.Name, "organisationId": marker.OrganisationId})
+			up.SetFilter(optionUpsertFilter(marker, marker.Name))
 			up.SetUpdate(bson.M{
 				"$setOnInsert": bson.M{
 					"value":          marker.Name,
@@ -231,9 +241,7 @@ func addMarker(ctxTracer context.Context, tracer *opentelemetry.Tracer, client *
 					"organisationId": marker.OrganisationId,
 					"createdAt":      now,
 				},
-				"$set": bson.M{
-					"updatedAt": now,
-				},
+				"$set": optionSetDoc(now, marker.ProjectId),
 				"$addToSet": bson.M{
 					"categories": bson.M{"$each": categoryNamesList},
 				},
@@ -261,7 +269,7 @@ func addMarker(ctxTracer context.Context, tracer *opentelemetry.Tracer, client *
 		if _, exists := tagSet[tag.Name]; !exists {
 			tagSet[tag.Name] = struct{}{}
 			up := mongo.NewUpdateOneModel()
-			up.SetFilter(bson.M{"value": tag.Name, "organisationId": marker.OrganisationId})
+			up.SetFilter(optionUpsertFilter(marker, tag.Name))
 			up.SetUpdate(bson.M{
 				"$setOnInsert": bson.M{
 					"value":          tag.Name,
@@ -269,9 +277,7 @@ func addMarker(ctxTracer context.Context, tracer *opentelemetry.Tracer, client *
 					"organisationId": marker.OrganisationId,
 					"createdAt":      now,
 				},
-				"$set": bson.M{
-					"updatedAt": now,
-				},
+				"$set": optionSetDoc(now, marker.ProjectId),
 			})
 			up.SetUpsert(true)
 			tagOptUpserts = append(tagOptUpserts, up)
@@ -296,7 +302,7 @@ func addMarker(ctxTracer context.Context, tracer *opentelemetry.Tracer, client *
 		if _, exists := eventSet[event.Name]; !exists {
 			eventSet[event.Name] = struct{}{}
 			up := mongo.NewUpdateOneModel()
-			up.SetFilter(bson.M{"value": event.Name, "organisationId": marker.OrganisationId})
+			up.SetFilter(optionUpsertFilter(marker, event.Name))
 			up.SetUpdate(bson.M{
 				"$setOnInsert": bson.M{
 					"value":          event.Name,
@@ -304,9 +310,7 @@ func addMarker(ctxTracer context.Context, tracer *opentelemetry.Tracer, client *
 					"organisationId": marker.OrganisationId,
 					"createdAt":      now,
 				},
-				"$set": bson.M{
-					"updatedAt": now,
-				},
+				"$set": optionSetDoc(now, marker.ProjectId),
 			})
 			up.SetUpsert(true)
 			eventOptUpserts = append(eventOptUpserts, up)
@@ -332,7 +336,7 @@ func addMarker(ctxTracer context.Context, tracer *opentelemetry.Tracer, client *
 		if _, exists := categorySet[category.Name]; !exists {
 			categorySet[category.Name] = struct{}{}
 			up := mongo.NewUpdateOneModel()
-			up.SetFilter(bson.M{"value": category.Name, "organisationId": marker.OrganisationId})
+			up.SetFilter(optionUpsertFilter(marker, category.Name))
 			up.SetUpdate(bson.M{
 				"$setOnInsert": bson.M{
 					"value":          category.Name,
@@ -340,9 +344,7 @@ func addMarker(ctxTracer context.Context, tracer *opentelemetry.Tracer, client *
 					"organisationId": marker.OrganisationId,
 					"createdAt":      now,
 				},
-				"$set": bson.M{
-					"updatedAt": now,
-				},
+				"$set": optionSetDoc(now, marker.ProjectId),
 			})
 			up.SetUpsert(true)
 			categoryOptUpserts = append(categoryOptUpserts, up)
