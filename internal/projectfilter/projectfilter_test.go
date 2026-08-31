@@ -72,17 +72,16 @@ func TestClause_ToleratesUnstampedOnlyForTheDefaultProject(t *testing.T) {
 	})
 }
 
-// TestApply_ComposesUnderAndBesideAnExistingOr pins the composition rule. The
-// marker writers already spend their top-level $or on device scope, while the
-// project clause is independently owned by models. Keeping it under $and avoids
-// coupling this adapter to that shared clause's representation.
+// TestApply_ComposesUnderAndBesideAnExistingOr pins the generic composition
+// rule. The tolerant project clause is itself an $or, so it must not overwrite
+// an unrelated disjunction already present on the caller's filter.
 func TestApply_ComposesUnderAndBesideAnExistingOr(t *testing.T) {
 	organisation := primitive.NewObjectID()
 	defaultProject := models.DefaultProjectId(organisation)
-	deviceScope := []bson.M{{"deviceKey": "device-1"}, {"deviceId": "device-1"}}
+	resourceScope := []bson.M{{"siteId": "site-1"}, {"groupId": "group-1"}}
 
 	filter := Apply(bson.M{
-		"$or":            deviceScope,
+		"$or":            resourceScope,
 		"organisationId": organisation.Hex(),
 	}, organisation.Hex(), &defaultProject)
 

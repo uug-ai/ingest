@@ -440,7 +440,7 @@ func TestMediaLinkFilter(t *testing.T) {
 
 	t.Run("omits absent scopes", func(t *testing.T) {
 		bare := mediaLinkFilter(models.Marker{}, "org/recording.mp4")
-		for _, key := range []string{"$or", "$and", "organisationId", "projectId"} {
+		for _, key := range []string{"$or", "$and", "deviceKey", "organisationId", "projectId"} {
 			if _, present := bare[key]; present {
 				t.Errorf("expected %q to be omitted for a marker that carries no scope", key)
 			}
@@ -562,8 +562,8 @@ func projectClause(t *testing.T, filter bson.M) bson.M {
 // DEFAULT project while still resolving media stored before the project axis
 // existed. A strict clause here would silently tag nothing for every recording
 // predating the project stamp, which is a linkage regression no other test would
-// catch. The clause lives under $and, independently of the $or the device scope
-// occupies.
+// catch. The clause lives under $and rather than being merged into the media
+// predicate.
 func assertTolerantProjectScope(t *testing.T, filter bson.M, projectId primitive.ObjectID) {
 	t.Helper()
 	clause := projectClause(t, filter)
@@ -592,29 +592,18 @@ func assertStrictProjectScope(t *testing.T, filter bson.M, projectId primitive.O
 	}
 }
 
-// assertDeviceScope checks that a filter narrows to the device by the live
-// deviceKey field while still resolving legacy documents that stored the key
-// under deviceId.
+// assertDeviceScope checks that a media filter narrows exclusively by the
+// canonical deviceKey field.
 func assertDeviceScope(t *testing.T, filter bson.M, deviceKey string) {
 	t.Helper()
-	scope, ok := filter["$or"].([]bson.M)
-	if !ok {
-		t.Fatalf("$or = %v, want a device scope", filter["$or"])
+	if got := filter["deviceKey"]; got != deviceKey {
+		t.Errorf("deviceKey = %v, want %q", got, deviceKey)
 	}
-	matched := map[string]bool{}
-	for _, clause := range scope {
-		for field, value := range clause {
-			if value != deviceKey {
-				t.Errorf("%s = %v, want %q", field, value, deviceKey)
-			}
-			matched[field] = true
-		}
+	if _, exists := filter["deviceId"]; exists {
+		t.Error("media scope must not query the deprecated deviceId field")
 	}
-	if !matched["deviceKey"] {
-		t.Error("device scope must match media.deviceKey, the field producers actually write")
-	}
-	if !matched["deviceId"] {
-		t.Error("device scope must still resolve legacy media that stored the key under deviceId")
+	if _, exists := filter["$or"]; exists {
+		t.Error("media device scope must not add a compatibility OR")
 	}
 }
 

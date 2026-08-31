@@ -406,7 +406,7 @@ func addMarker(ctxTracer context.Context, tracer *opentelemetry.Tracer, client *
 	//     exactly which recording(s) the marker was derived from (media.videoFile),
 	//     so stamp those recordings directly — scoped to the marker's device and
 	//     organisation so a caller can only tag media it owns (see
-	//     mediaDeviceScope for why the device predicate is not "deviceId"), and
+	//     mediaDeviceScope for why the device predicate is "deviceKey"), and
 	//     with NO timestamp guard, since the key is the source of truth (immune
 	//     to timing/fps drift).
 	//  2. Explicit media _ids (legacy by-id authoring path). Stamp those docs,
@@ -443,7 +443,6 @@ func addMarker(ctxTracer context.Context, tracer *opentelemetry.Tracer, client *
 			},
 		}
 	}
-
 	switch {
 	case len(marker.MediaKeys) > 0:
 		if len(update) > 0 {
@@ -506,31 +505,6 @@ func markerUpsertFilter(marker models.Marker) bson.M {
 	}, marker.OrganisationId, marker.ProjectId)
 }
 
-// mediaDeviceScope is the media-collection predicate that narrows a marker write
-// to the device the marker belongs to.
-//
-// models.Marker.DeviceId carries the device *key* — every producer fills it from
-// media.DeviceKey — while a media document stores that key under "deviceKey".
-// media."deviceId" is a different, deprecated field that nothing writes:
-// models.Media tags it `bson:"deviceId,omitempty"` and PipelineEvent.GetMedia
-// only ever assigns DeviceKey, on both the structured-metadata and the legacy
-// filename path, so omitempty leaves the field out of the stored document
-// entirely. Filtering on "deviceId" therefore compares a device key against a
-// field that is not there: UpdateMany matches nothing and returns no error, so
-// the marker is written while the media is silently never tagged.
-//
-// Both names are accepted — "deviceKey" is what the pipeline writes today,
-// "deviceId" keeps any legacy document that predates the rename resolvable. An
-// empty key yields a predicate that matches nothing (both fields are omitempty,
-// so no document stores ""), which keeps a marker with no device from tagging
-// every recording in the collection.
-func mediaDeviceScope(deviceKey string) []bson.M {
-	return []bson.M{
-		{"deviceKey": deviceKey},
-		{"deviceId": deviceKey},
-	}
-}
-
 // mediaLinkFilter selects the recording a marker names explicitly, by its key
 // (media.videoFile). There is deliberately no timestamp guard: the key pins the
 // recording regardless of the marker's absolute timing, which is what makes this
@@ -550,21 +524,20 @@ func mediaDeviceScope(deviceKey string) []bson.M {
 func mediaLinkFilter(marker models.Marker, key string) bson.M {
 	filter := bson.M{"videoFile": key}
 	if marker.DeviceId != "" {
-		filter["$or"] = mediaDeviceScope(marker.DeviceId)
+		filter["deviceKey"] = marker.DeviceId
 	}
 	if marker.OrganisationId != "" {
 		filter["organisationId"] = marker.OrganisationId
 	}
-	// The project clause composes under $and, never merged into this map: the
-	// device scope above already owns the top-level $or, and the tolerant project
-	// clause is an $or too — merging would drop one of the two and the query
-	// would silently stop matching on device.
+	// The project clause composes under $and so its default-compatible predicate
+	// remains intact.
 	return projectfilter.Apply(filter, marker.OrganisationId, marker.ProjectId)
 }
 
 // mediaOverlapFilter is the fallback for a marker that names no recording at
 // all: every media on the same device whose span overlaps the marker's. The
-// device scope owns $or here too, so the project clause composes under $and.
+// project clause composes under $and so the default-compatible
+// project predicate retains its own shape.
 //
 // Unlike mediaLinkFilter the organisation clause is unconditional, because this
 // is the one media path with no pin on a specific document. There the key
@@ -576,12 +549,12 @@ func mediaLinkFilter(marker models.Marker, key string) bson.M {
 //
 // A marker with no organisation therefore matches nothing: media.organisationId
 // is `omitempty`, so no stored document carries "". That is the same fail-closed
-// stance mediaDeviceScope already takes for an empty device key, and it costs
+// stance an exact empty deviceKey predicate already takes, and it costs
 // only the linkage on media written before the monitor stage began stamping
 // ownership — the trade mediaLinkFilter's doc comment already spells out.
 func mediaOverlapFilter(marker models.Marker) bson.M {
 	return projectfilter.Apply(bson.M{
-		"$or":            mediaDeviceScope(marker.DeviceId),
+		"deviceKey":      marker.DeviceId,
 		"organisationId": marker.OrganisationId,
 		"startTimestamp": bson.M{"$lte": marker.EndTimestamp},
 		"endTimestamp":   bson.M{"$gte": marker.StartTimestamp},
