@@ -57,6 +57,7 @@ func approx(got, want float64) bool {
 func pixelPayload(t *testing.T) json.RawMessage {
 	t.Helper()
 	body := map[string]any{
+		"name":            "Front entrance",
 		"schemaVersion":   "1.0",
 		"source":          map[string]any{"kind": "model", "name": "acme", "version": "1", "runId": "RUN-1"},
 		"coordinateSpace": "pixel",
@@ -98,6 +99,9 @@ func TestIngest_PixelNormalizesAndStores(t *testing.T) {
 	}
 	if run.Task != models.DetectionTask {
 		t.Errorf("task = %q, want %q", run.Task, models.DetectionTask)
+	}
+	if run.Name != "Front entrance" {
+		t.Errorf("name = %q, want %q", run.Name, "Front entrance")
 	}
 	if run.OriginalCoordinateSpace != "pixel" || run.OriginalBoxForm != "xyxy" {
 		t.Errorf("original space/form = %q/%q", run.OriginalCoordinateSpace, run.OriginalBoxForm)

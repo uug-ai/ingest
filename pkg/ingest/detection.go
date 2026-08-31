@@ -390,6 +390,7 @@ func (boxTask) Normalize(req api.PostDetectionsRequest) (models.DetectionRun, Re
 	}
 
 	run := models.DetectionRun{
+		Name:                    req.Name,
 		Source:                  source,
 		SchemaVersion:           req.SchemaVersion,
 		Media:                   req.Media,

@@ -52,29 +52,7 @@ func TestClause_ToleratesUnstampedOnlyForTheDefaultProject(t *testing.T) {
 		defaultProject := models.DefaultProjectId(organisation)
 
 		clause := Clause(organisationId, &defaultProject)
-		arms, ok := clause["$or"].([]bson.M)
-		if !ok {
-			t.Fatalf("clause = %#v, want an $or with a tolerant arm", clause)
-		}
-		var matchesProject, matchesUnstamped bool
-		for _, arm := range arms {
-			switch value := arm["projectId"].(type) {
-			case primitive.ObjectID:
-				matchesProject = value == defaultProject
-			case nil:
-				matchesUnstamped = true
-			case bson.M:
-				if value["$exists"] == false {
-					matchesUnstamped = true
-				}
-			}
-		}
-		if !matchesProject {
-			t.Errorf("$or = %#v, want an arm matching %v", arms, defaultProject)
-		}
-		if !matchesUnstamped {
-			t.Errorf("$or = %#v, want an arm matching documents with no projectId", arms)
-		}
+		assertTolerantDefaultProjectClause(t, clause, defaultProject)
 	})
 
 	t.Run("a real project matches only what is stamped for it", func(t *testing.T) {
@@ -94,11 +72,10 @@ func TestClause_ToleratesUnstampedOnlyForTheDefaultProject(t *testing.T) {
 	})
 }
 
-// TestApply_ComposesUnderAndBesideAnExistingOr pins the composition rule, and it
-// is the other half of the regression. The tolerant clause is itself an $or,
-// while the marker writers already spend their top-level $or on the device
-// scope. Merging the two would leave only one — no error, no duplicate key, just
-// a query that quietly stops narrowing by device.
+// TestApply_ComposesUnderAndBesideAnExistingOr pins the composition rule. The
+// marker writers already spend their top-level $or on device scope, while the
+// project clause is independently owned by models. Keeping it under $and avoids
+// coupling this adapter to that shared clause's representation.
 func TestApply_ComposesUnderAndBesideAnExistingOr(t *testing.T) {
 	organisation := primitive.NewObjectID()
 	defaultProject := models.DefaultProjectId(organisation)
@@ -122,8 +99,18 @@ func TestApply_ComposesUnderAndBesideAnExistingOr(t *testing.T) {
 	if !ok || len(and) != 1 {
 		t.Fatalf("$and = %#v, want the project clause nested under it", filter["$and"])
 	}
-	if _, tolerant := and[0]["$or"]; !tolerant {
-		t.Errorf("$and[0] = %#v, want the project clause's own $or preserved", and[0])
+	assertTolerantDefaultProjectClause(t, and[0], defaultProject)
+}
+
+func assertTolerantDefaultProjectClause(t *testing.T, clause bson.M, projectId primitive.ObjectID) {
+	t.Helper()
+	condition, ok := clause["projectId"].(bson.M)
+	if !ok {
+		t.Fatalf("project clause = %#v, want a projectId condition", clause)
+	}
+	values, ok := condition["$in"].(bson.A)
+	if !ok || len(values) != 2 || values[0] != projectId || values[1] != nil {
+		t.Fatalf("projectId condition = %#v, want $in [%v, nil]", condition, projectId)
 	}
 }
 

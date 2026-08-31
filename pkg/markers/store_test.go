@@ -363,9 +363,9 @@ func TestOptionUpsertCarriesProjectScope(t *testing.T) {
 
 // TestMarkerSetDocCarriesProject pins what the upsert's $set must contain, and
 // it is load-bearing for the identity filter above rather than a tautology about
-// bson tags. For the organisation's default project the project clause is an
-// $or, and Mongo seeds an upserted document only from a filter's *equality*
-// clauses — so nothing in the filter would put projectId on a fresh insert. This
+// bson tags. For the organisation's default project the project equality is
+// nested in an $in, and Mongo seeds an upserted document only from a filter's
+// direct *equality* clauses — so nothing in the filter would put projectId on a fresh insert. This
 // $set is the only thing that stamps it, and the only thing that back-fills a
 // matched legacy marker.
 func TestMarkerSetDocCarriesProject(t *testing.T) {
@@ -383,7 +383,7 @@ func TestMarkerSetDocCarriesProject(t *testing.T) {
 	}
 	if got := set["projectId"]; got != projectId {
 		t.Errorf("$set projectId = %v, want %v — without it an upsert under the "+
-			"tolerant $or clause inserts an unstamped marker", got, projectId)
+			"tolerant $in clause inserts an unstamped marker", got, projectId)
 	}
 	if _, present := set["_id"]; present {
 		t.Error("$set must not carry _id: the first insert owns it")
@@ -562,33 +562,18 @@ func projectClause(t *testing.T, filter bson.M) bson.M {
 // DEFAULT project while still resolving media stored before the project axis
 // existed. A strict clause here would silently tag nothing for every recording
 // predating the project stamp, which is a linkage regression no other test would
-// catch. The clause lives under $and so it never collides with the $or the
-// device scope occupies.
+// catch. The clause lives under $and, independently of the $or the device scope
+// occupies.
 func assertTolerantProjectScope(t *testing.T, filter bson.M, projectId primitive.ObjectID) {
 	t.Helper()
 	clause := projectClause(t, filter)
-	arms, ok := clause["$or"].([]bson.M)
+	condition, ok := clause["projectId"].(bson.M)
 	if !ok {
-		t.Fatalf("project clause = %#v, want a tolerant $or for the default project", clause)
+		t.Fatalf("project clause = %#v, want a projectId condition", clause)
 	}
-	var matchesProject, matchesUnstamped bool
-	for _, arm := range arms {
-		switch value := arm["projectId"].(type) {
-		case primitive.ObjectID:
-			matchesProject = matchesProject || value == projectId
-		case nil:
-			matchesUnstamped = true
-		case bson.M:
-			if value["$exists"] == false {
-				matchesUnstamped = true
-			}
-		}
-	}
-	if !matchesProject {
-		t.Errorf("project clause = %#v, want an arm matching %v", clause, projectId)
-	}
-	if !matchesUnstamped {
-		t.Errorf("project clause = %#v, want an arm matching unstamped documents", clause)
+	values, ok := condition["$in"].(bson.A)
+	if !ok || len(values) != 2 || values[0] != projectId || values[1] != nil {
+		t.Errorf("projectId condition = %#v, want $in [%v, nil]", condition, projectId)
 	}
 }
 
@@ -602,7 +587,7 @@ func assertStrictProjectScope(t *testing.T, filter bson.M, projectId primitive.O
 	if got := clause["projectId"]; got != projectId {
 		t.Errorf("project clause = %#v, want strict equality on %v", clause, projectId)
 	}
-	if _, tolerant := clause["$or"]; tolerant {
+	if _, tolerant := clause["projectId"].(bson.M); tolerant {
 		t.Errorf("project clause = %#v, want no tolerant arm for a non-default project", clause)
 	}
 }

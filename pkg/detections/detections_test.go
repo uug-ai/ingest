@@ -117,25 +117,13 @@ func TestUpsertFilterScopesToProject(t *testing.T) {
 	if !ok || len(and) != 1 {
 		t.Fatalf("$and = %#v, want exactly the project clause", filter["$and"])
 	}
-	arms, ok := and[0]["$or"].([]bson.M)
+	condition, ok := and[0]["projectId"].(bson.M)
 	if !ok {
-		t.Fatalf("project clause = %#v, want a tolerant $or for the default project", and[0])
+		t.Fatalf("project clause = %#v, want a projectId condition", and[0])
 	}
-	var matchesProject, matchesUnstamped bool
-	for _, arm := range arms {
-		switch value := arm["projectId"].(type) {
-		case primitive.ObjectID:
-			matchesProject = matchesProject || value == defaultProject
-		case nil:
-			matchesUnstamped = true
-		case bson.M:
-			if value["$exists"] == false {
-				matchesUnstamped = true
-			}
-		}
-	}
-	if !matchesProject || !matchesUnstamped {
-		t.Errorf("project clause = %#v, want arms for %v and for unstamped runs", and[0], defaultProject)
+	values, ok := condition["$in"].(bson.A)
+	if !ok || len(values) != 2 || values[0] != defaultProject || values[1] != nil {
+		t.Errorf("projectId condition = %#v, want $in [%v, nil]", condition, defaultProject)
 	}
 
 	t.Run("a real project matches only its own runs", func(t *testing.T) {
@@ -188,6 +176,6 @@ func TestUpsertSetCarriesProject(t *testing.T) {
 	}
 	if got := doc["projectId"]; got != projectId {
 		t.Errorf("$set projectId = %v, want %v — without it an upsert under the "+
-			"tolerant $or clause inserts an unstamped run", got, projectId)
+			"tolerant $in clause inserts an unstamped run", got, projectId)
 	}
 }
