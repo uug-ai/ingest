@@ -95,28 +95,16 @@ func TestPatchMedia_ScopesToProject(t *testing.T) {
 			t.Fatalf("filter type = %T, want bson.M", collection.filter)
 		}
 		clause := projectClause(t, filter)
-		arms, ok := clause["$or"].([]bson.M)
+		condition, ok := clause["projectId"].(bson.M)
 		if !ok {
-			t.Fatalf("project clause = %#v, want a tolerant $or for the default project", clause)
+			t.Fatalf("project clause = %#v, want a projectId condition", clause)
 		}
-		// The tolerant arm is what keeps media stored before the project axis
+		// The null value is what keeps media stored before the project axis
 		// existed patchable — without it every pre-rollout recording becomes a
 		// permanent "not found" and its patch is dropped rather than retried.
-		var matchesProject, matchesUnstamped bool
-		for _, arm := range arms {
-			switch value := arm["projectId"].(type) {
-			case primitive.ObjectID:
-				matchesProject = matchesProject || value == projectId
-			case nil:
-				matchesUnstamped = true
-			case bson.M:
-				if value["$exists"] == false {
-					matchesUnstamped = true
-				}
-			}
-		}
-		if !matchesProject || !matchesUnstamped {
-			t.Errorf("project clause = %#v, want arms for %v and for unstamped media", clause, projectId)
+		values, ok := condition["$in"].(bson.A)
+		if !ok || len(values) != 2 || values[0] != projectId || values[1] != nil {
+			t.Errorf("projectId condition = %#v, want $in [%v, nil]", condition, projectId)
 		}
 		if filter["organisationId"] != organisation.Hex() {
 			t.Errorf("filter organisationId = %v, want %v (the project narrows, it never replaces the org)", filter["organisationId"], organisation.Hex())

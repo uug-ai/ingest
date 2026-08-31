@@ -43,13 +43,10 @@ func Clause(organisationId string, projectId *primitive.ObjectID) bson.M {
 // Apply composes the project clause into filter, and leaves filter untouched
 // when there is no project to scope to.
 //
-// It composes under $and rather than merging the clause's keys into filter,
-// because the tolerant form of the predicate is ITSELF an $or and several
-// callers already spend their top-level $or on another axis (the marker writers
-// scope the device that way). Merging would have one $or overwrite the other,
-// and the resulting query would quietly stop matching on device — no error, no
-// duplicate-key, just a marker that tags nothing. $and nests both, so each axis
-// keeps its own operator.
+// It composes under $and rather than merging the clause's keys into filter so
+// callers do not depend on the shared predicate's BSON representation. Marker
+// writers also spend their top-level $or on device scope; nesting each axis
+// keeps those independently owned clauses from colliding if either evolves.
 //
 // $and is owned by this package: callers keep their other clauses under their
 // own keys and let this one accumulate here.
