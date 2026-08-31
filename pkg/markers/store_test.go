@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"testing"
 	"time"
 
@@ -20,6 +21,28 @@ import (
 // without importing this package. This assertion lives in a test file so the
 // production markers package stays free of any dependency on the orchestrator.
 var _ ingest.MarkerStore = (*Store)(nil)
+
+func TestRangeIdentityFilterUsesStableMarkerIdentityAndProject(t *testing.T) {
+	organisationId := primitive.NewObjectID()
+	projectId := primitive.NewObjectID()
+	filter := rangeIdentityFilter(bson.M{
+		"value": "person", "organisationId": organisationId.Hex(), "projectId": projectId,
+		"deviceId": "device-1", "groupId": "group-1", "start": int64(10), "end": int64(20),
+	})
+	if filter["value"] != "person" || filter["deviceId"] != "device-1" || filter["start"] != int64(10) {
+		t.Fatalf("stable range identity = %#v", filter)
+	}
+	if _, present := filter["groupId"]; present {
+		t.Fatalf("mutable groupId is part of range identity: %#v", filter)
+	}
+	if _, present := filter["end"]; present {
+		t.Fatalf("mutable end is part of range identity: %#v", filter)
+	}
+	and, ok := filter["$and"].([]bson.M)
+	if !ok || len(and) != 1 || !reflect.DeepEqual(and[0], models.ProjectScopeFilter(organisationId.Hex(), projectId)) {
+		t.Fatalf("project identity = %#v, want %s", filter, projectId.Hex())
+	}
+}
 
 // TestMarkerWriterModes verifies the one behavioural difference between the two
 // entry points against a real Mongo: the upsert path is idempotent (a redelivery

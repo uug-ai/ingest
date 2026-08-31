@@ -702,9 +702,10 @@ func rangeDoc(doc bson.M, projectId *primitive.ObjectID) bson.M {
 // writeRanges persists the denormalised *_ranges documents. In insert mode it
 // appends them (the authoring path, where a marker is written once). In
 // idempotent mode it upserts each document keyed by its natural identity
-// (value, organisationId, projectId, deviceId, start, end) so a redelivery of
+// (value, organisationId, projectId, deviceId, start) so a redelivery of
 // the same marker refreshes the range rather than duplicating it; createdAt is
-// seeded once on first insert.
+// seeded once on first insert. Mutable relationship and boundary fields such as
+// groupId and end remain in $set, matching the marker upsert's stable identity.
 //
 // projectId is matched through the shared project clause but deliberately kept
 // OUT of the identity skip-list below, so it still flows into the $set. Mongo
@@ -731,26 +732,13 @@ func writeRanges(ctx context.Context, col *mongo.Collection, docs []any, idempot
 			continue
 		}
 
-		filter := bson.M{
-			"value":          doc["value"],
-			"organisationId": doc["organisationId"],
-			"deviceId":       doc["deviceId"],
-			"start":          doc["start"],
-			"end":            doc["end"],
-		}
-		if projectId, ok := doc["projectId"].(primitive.ObjectID); ok {
-			// The organisation the range belongs to decides which shape the project
-			// clause takes (tolerant only for that organisation's default project),
-			// so it has to be read back out of the range document here.
-			organisationId, _ := doc["organisationId"].(string)
-			projectfilter.Apply(filter, organisationId, &projectId)
-		}
+		filter := rangeIdentityFilter(doc)
 
 		set := bson.M{}
 		setOnInsert := bson.M{}
 		for k, v := range doc {
 			switch k {
-			case "value", "organisationId", "deviceId", "start", "end":
+			case "value", "organisationId", "deviceId", "start":
 				// Part of the identity filter; Mongo seeds these from the filter on
 				// insert, so they need not be repeated in the update.
 				continue
@@ -775,4 +763,18 @@ func writeRanges(ctx context.Context, col *mongo.Collection, docs []any, idempot
 
 	_, err := col.BulkWrite(ctx, writeModels)
 	return err
+}
+
+func rangeIdentityFilter(doc bson.M) bson.M {
+	filter := bson.M{
+		"value":          doc["value"],
+		"organisationId": doc["organisationId"],
+		"deviceId":       doc["deviceId"],
+		"start":          doc["start"],
+	}
+	if projectId, ok := doc["projectId"].(primitive.ObjectID); ok {
+		organisationId, _ := doc["organisationId"].(string)
+		projectfilter.Apply(filter, organisationId, &projectId)
+	}
+	return filter
 }
