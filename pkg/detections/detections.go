@@ -12,6 +12,7 @@ package detections
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/uug-ai/ingest/internal/projectfilter"
@@ -36,6 +37,10 @@ type Store struct {
 	db *mongo.Database
 }
 
+type detectionCollection interface {
+	UpdateOne(context.Context, any, any, ...*options.UpdateOptions) (*mongo.UpdateResult, error)
+}
+
 // NewStore builds the ingest detection sink over a Mongo database.
 func NewStore(db *mongo.Database) *Store {
 	return &Store{db: db}
@@ -57,7 +62,72 @@ func NewStore(db *mongo.Database) *Store {
 // from. A matched legacy run is therefore refreshed and back-filled by this
 // same operation rather than duplicated beside it.
 func (s *Store) UpsertDetectionRun(ctx context.Context, run models.DetectionRun) error {
-	coll := s.db.Collection(DetectionsCollection)
+	allowLegacyAdoption, err := canAdoptLegacyDetection(ctx, s.db.Collection("analysis"), run)
+	if err != nil {
+		return err
+	}
+	return upsertDetectionRun(ctx, s.db.Collection(DetectionsCollection), run, allowLegacyAdoption)
+}
+
+type analysisParent struct {
+	OrganisationId string              `bson:"organisationId"`
+	ProjectId      *primitive.ObjectID `bson:"projectId"`
+	UserId         string              `bson:"userid"`
+	LegacyUserId   string              `bson:"user_id"`
+}
+
+func canAdoptLegacyDetection(ctx context.Context, coll *mongo.Collection, run models.DetectionRun) (bool, error) {
+	cursor, err := coll.Find(
+		ctx,
+		bson.M{"key": run.Key},
+		options.Find().SetLimit(2).SetProjection(bson.M{
+			"organisationId": 1,
+			"projectId":      1,
+			"userid":         1,
+			"user_id":        1,
+		}),
+	)
+	if err != nil {
+		return false, err
+	}
+	defer cursor.Close(ctx)
+
+	var parents []analysisParent
+	if err := cursor.All(ctx, &parents); err != nil {
+		return false, err
+	}
+	return uniqueParentMatchesRun(parents, run), nil
+}
+
+func uniqueParentMatchesRun(parents []analysisParent, run models.DetectionRun) bool {
+	return len(parents) == 1 && parentMatchesRun(parents[0], run)
+}
+
+func parentMatchesRun(parent analysisParent, run models.DetectionRun) bool {
+	organisationId := parent.OrganisationId
+	if organisationId == "" {
+		organisationId = parent.UserId
+	}
+	if organisationId == "" {
+		organisationId = parent.LegacyUserId
+	}
+	if organisationId == "" || organisationId != run.OrganisationId || run.ProjectId == nil || run.ProjectId.IsZero() {
+		return false
+	}
+
+	projectId := parent.ProjectId
+	if projectId == nil || projectId.IsZero() {
+		ownerId, err := primitive.ObjectIDFromHex(organisationId)
+		if err != nil {
+			return false
+		}
+		defaultProjectId := models.DefaultProjectId(ownerId)
+		projectId = &defaultProjectId
+	}
+	return *projectId == *run.ProjectId
+}
+
+func upsertDetectionRun(ctx context.Context, coll detectionCollection, run models.DetectionRun, allowLegacyAdoption bool) error {
 	now := time.Now().UnixMilli()
 
 	// Server-owned identity / denormalised fields. _id and createdAt are left
@@ -67,7 +137,7 @@ func (s *Store) UpsertDetectionRun(ctx context.Context, run models.DetectionRun)
 	run.CreatedAt = 0
 	run.UpdatedAt = now
 
-	filter := upsertFilter(run)
+	filter := upsertFilter(run, allowLegacyAdoption)
 	update := bson.M{
 		"$set":         run,
 		"$setOnInsert": bson.M{"createdAt": now},
@@ -77,20 +147,48 @@ func (s *Store) UpsertDetectionRun(ctx context.Context, run models.DetectionRun)
 	if mongo.IsDuplicateKeyError(err) {
 		// A concurrent writer won the race on the unique (key, source.runId)
 		// index between our filter check and the upsert. Retry without upsert
-		// so our $set now matches and replaces it (last write wins).
-		_, err = coll.UpdateOne(ctx, filter, update)
+		// so our $set now matches and replaces it (last write wins). A duplicate
+		// owned by conflicting canonical scope does not match this filter; do not
+		// report that conflict as a successful write.
+		duplicateErr := err
+		result, retryErr := coll.UpdateOne(ctx, filter, update)
+		if retryErr != nil {
+			return retryErr
+		}
+		if result == nil || result.MatchedCount == 0 {
+			return fmt.Errorf("detections: duplicate-key retry matched no document: %w", duplicateErr)
+		}
+		return nil
 	}
 	return err
 }
 
-// upsertFilter is the run's stable identity. It is a function rather than an
-// inline literal so the tenant scoping can be asserted without a database. The
-// project clause composes under $and rather than merging into this map, so it
-// can carry its own $or without colliding with anything the identity uses.
-func upsertFilter(run models.DetectionRun) bson.M {
-	return projectfilter.Apply(bson.M{
-		"key":            run.Key,
-		"organisationId": run.OrganisationId,
-		"source.runId":   run.Source.RunId,
-	}, run.OrganisationId, run.ProjectId)
+// upsertFilter is the run's stable identity. Exact canonical ownership takes
+// precedence. A document without canonical organisation ownership may be
+// adopted only when its project also matches the incoming source authority;
+// that project predicate tolerates an unstamped project only for the
+// organisation's deterministic default project. This back-fills legacy runs
+// without allowing a non-default project or conflicting canonical owner to
+// claim them.
+func upsertFilter(run models.DetectionRun, allowLegacyAdoption bool) bson.M {
+	filter := bson.M{
+		"key":          run.Key,
+		"source.runId": run.Source.RunId,
+	}
+	canonical := projectfilter.Apply(
+		bson.M{"organisationId": run.OrganisationId},
+		run.OrganisationId,
+		run.ProjectId,
+	)
+	ownership := bson.A{canonical}
+	if allowLegacyAdoption && run.OrganisationId != "" && run.ProjectId != nil && !run.ProjectId.IsZero() {
+		legacy := projectfilter.Apply(
+			bson.M{"organisationId": bson.M{"$in": bson.A{nil, ""}}},
+			run.OrganisationId,
+			run.ProjectId,
+		)
+		ownership = append(ownership, legacy)
+	}
+	filter["$or"] = ownership
+	return filter
 }
