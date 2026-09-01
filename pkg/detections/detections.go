@@ -12,6 +12,7 @@ package detections
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -35,6 +36,11 @@ const DetectionsCollection = "detections"
 // database the runs are written into.
 type Store struct {
 	db *mongo.Database
+}
+
+// WriteResult describes whether an upsert replaced an existing detection run.
+type WriteResult struct {
+	Replaced bool
 }
 
 type detectionCollection interface {
@@ -62,9 +68,17 @@ func NewStore(db *mongo.Database) *Store {
 // from. A matched legacy run is therefore refreshed and back-filled by this
 // same operation rather than duplicated beside it.
 func (s *Store) UpsertDetectionRun(ctx context.Context, run models.DetectionRun) error {
+	_, err := s.Upsert(ctx, run)
+	return err
+}
+
+// Upsert persists a detection run and reports whether it replaced an existing
+// run. Callers that only implement ingest.DetectionStore should continue using
+// UpsertDetectionRun.
+func (s *Store) Upsert(ctx context.Context, run models.DetectionRun) (WriteResult, error) {
 	allowLegacyAdoption, err := canAdoptLegacyDetection(ctx, s.db.Collection("analysis"), run)
 	if err != nil {
-		return err
+		return WriteResult{}, err
 	}
 	return upsertDetectionRun(ctx, s.db.Collection(DetectionsCollection), run, allowLegacyAdoption)
 }
@@ -127,7 +141,7 @@ func parentMatchesRun(parent analysisParent, run models.DetectionRun) bool {
 	return *projectId == *run.ProjectId
 }
 
-func upsertDetectionRun(ctx context.Context, coll detectionCollection, run models.DetectionRun, allowLegacyAdoption bool) error {
+func upsertDetectionRun(ctx context.Context, coll detectionCollection, run models.DetectionRun, allowLegacyAdoption bool) (WriteResult, error) {
 	now := time.Now().UnixMilli()
 
 	// Server-owned identity / denormalised fields. _id and createdAt are left
@@ -143,7 +157,7 @@ func upsertDetectionRun(ctx context.Context, coll detectionCollection, run model
 		"$setOnInsert": bson.M{"createdAt": now},
 	}
 
-	_, err := coll.UpdateOne(ctx, filter, update, options.Update().SetUpsert(true))
+	result, err := coll.UpdateOne(ctx, filter, update, options.Update().SetUpsert(true))
 	if mongo.IsDuplicateKeyError(err) {
 		// A concurrent writer won the race on the unique (key, source.runId)
 		// index between our filter check and the upsert. Retry without upsert
@@ -151,16 +165,23 @@ func upsertDetectionRun(ctx context.Context, coll detectionCollection, run model
 		// owned by conflicting canonical scope does not match this filter; do not
 		// report that conflict as a successful write.
 		duplicateErr := err
-		result, retryErr := coll.UpdateOne(ctx, filter, update)
+		var retryErr error
+		result, retryErr = coll.UpdateOne(ctx, filter, update)
 		if retryErr != nil {
-			return retryErr
+			return WriteResult{}, retryErr
 		}
 		if result == nil || result.MatchedCount == 0 {
-			return fmt.Errorf("detections: duplicate-key retry matched no document: %w", duplicateErr)
+			return WriteResult{}, fmt.Errorf("detections: duplicate-key retry matched no document: %w", duplicateErr)
 		}
-		return nil
+		return WriteResult{Replaced: true}, nil
 	}
-	return err
+	if err != nil {
+		return WriteResult{}, err
+	}
+	if result == nil {
+		return WriteResult{}, errors.New("detections: upsert returned no result")
+	}
+	return WriteResult{Replaced: result.MatchedCount > 0}, nil
 }
 
 // upsertFilter is the run's stable identity. Exact canonical ownership takes

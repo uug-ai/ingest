@@ -289,8 +289,12 @@ func TestUpsertDetectionRunDuplicateRetry(t *testing.T) {
 			results: []*mongo.UpdateResult{nil, {MatchedCount: 1}},
 			errors:  []error{duplicateErr, nil},
 		}
-		if err := upsertDetectionRun(context.Background(), coll, run, false); err != nil {
+		result, err := upsertDetectionRun(context.Background(), coll, run, false)
+		if err != nil {
 			t.Fatalf("upsertDetectionRun: %v", err)
+		}
+		if !result.Replaced {
+			t.Fatal("matched duplicate retry must report replacement")
 		}
 		if len(coll.options) != 2 || coll.options[0] == nil || coll.options[0].Upsert == nil || !*coll.options[0].Upsert {
 			t.Fatalf("first write options = %#v, want upsert", coll.options)
@@ -305,7 +309,7 @@ func TestUpsertDetectionRunDuplicateRetry(t *testing.T) {
 			results: []*mongo.UpdateResult{nil, {MatchedCount: 0}},
 			errors:  []error{duplicateErr, nil},
 		}
-		err := upsertDetectionRun(context.Background(), coll, run, false)
+		_, err := upsertDetectionRun(context.Background(), coll, run, false)
 		if err == nil {
 			t.Fatal("upsertDetectionRun returned nil after an unmatched duplicate retry")
 		}
@@ -320,8 +324,46 @@ func TestUpsertDetectionRunDuplicateRetry(t *testing.T) {
 			results: []*mongo.UpdateResult{nil, nil},
 			errors:  []error{duplicateErr, retryErr},
 		}
-		if err := upsertDetectionRun(context.Background(), coll, run, false); !errors.Is(err, retryErr) {
+		if _, err := upsertDetectionRun(context.Background(), coll, run, false); !errors.Is(err, retryErr) {
 			t.Fatalf("upsertDetectionRun error = %v, want %v", err, retryErr)
+		}
+	})
+}
+
+func TestUpsertDetectionRunResult(t *testing.T) {
+	run := models.DetectionRun{Key: "media-1", OrganisationId: primitive.NewObjectID().Hex()}
+	run.Source.RunId = "run-1"
+
+	for _, test := range []struct {
+		name         string
+		mongoResult  *mongo.UpdateResult
+		wantReplaced bool
+	}{
+		{name: "inserted", mongoResult: &mongo.UpdateResult{UpsertedCount: 1}},
+		{name: "replaced", mongoResult: &mongo.UpdateResult{MatchedCount: 1}, wantReplaced: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			coll := &fakeDetectionCollection{
+				results: []*mongo.UpdateResult{test.mongoResult},
+				errors:  []error{nil},
+			}
+			result, err := upsertDetectionRun(t.Context(), coll, run, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Replaced != test.wantReplaced {
+				t.Fatalf("Replaced = %t, want %t", result.Replaced, test.wantReplaced)
+			}
+		})
+	}
+
+	t.Run("nil result fails closed", func(t *testing.T) {
+		coll := &fakeDetectionCollection{
+			results: []*mongo.UpdateResult{nil},
+			errors:  []error{nil},
+		}
+		if _, err := upsertDetectionRun(t.Context(), coll, run, false); err == nil {
+			t.Fatal("nil successful result must fail closed")
 		}
 	})
 }
