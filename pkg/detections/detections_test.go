@@ -2,6 +2,7 @@ package detections
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"testing"
@@ -55,14 +56,20 @@ func TestUpsertDetectionRunIsIdempotent(t *testing.T) {
 	}
 	run.Source.RunId = "run-1"
 
-	// Seed a run written before the project axis existed. The tolerant predicate
-	// must refresh and back-fill it rather than insert a second document beside
-	// it — this is the case a strict projectId clause would silently duplicate.
+	// Seed a run written before either canonical ownership axis existed. The
+	// source recording key is the stable authority that lets the default-project
+	// write adopt and back-fill it rather than create a second document.
 	if _, err := db.Collection(DetectionsCollection).InsertOne(ctx, bson.M{
-		"key": run.Key, "organisationId": run.OrganisationId,
+		"key":    run.Key,
 		"source": bson.M{"runId": run.Source.RunId},
 	}); err != nil {
 		t.Fatalf("seed legacy run: %v", err)
+	}
+	if _, err := db.Collection("analysis").InsertOne(ctx, bson.M{
+		"key":    run.Key,
+		"userid": organisation.Hex(),
+	}); err != nil {
+		t.Fatalf("seed legacy analysis parent: %v", err)
 	}
 
 	// Upsert the same run twice: identity keying collapses the two writes into a
@@ -88,6 +95,9 @@ func TestUpsertDetectionRunIsIdempotent(t *testing.T) {
 	if stored["projectId"] != projectId {
 		t.Errorf("stored projectId = %v, want %v back-filled onto the pre-rollout run", stored["projectId"], projectId)
 	}
+	if stored["organisationId"] != organisation.Hex() {
+		t.Errorf("stored organisationId = %v, want %v back-filled from source authority", stored["organisationId"], organisation.Hex())
+	}
 }
 
 // TestUpsertFilterScopesToProject pins the identity filter's tenant axes without
@@ -105,51 +115,213 @@ func TestUpsertFilterScopesToProject(t *testing.T) {
 	run := models.DetectionRun{Key: "media-1", OrganisationId: organisation.Hex(), ProjectId: &defaultProject}
 	run.Source.RunId = "run-1"
 
-	filter := upsertFilter(run)
+	filter := upsertFilter(run, true)
 
-	if filter["key"] != "media-1" || filter["organisationId"] != organisation.Hex() || filter["source.runId"] != "run-1" {
-		t.Errorf("filter = %#v, want the (key, organisationId, source.runId) identity intact", filter)
+	if filter["key"] != "media-1" || filter["source.runId"] != "run-1" {
+		t.Errorf("filter = %#v, want the (key, source.runId) identity intact", filter)
 	}
-	if _, merged := filter["projectId"]; merged {
-		t.Fatalf("filter = %#v, want the project clause under $and, not merged as a top-level key", filter)
+	branches, ok := filter["$or"].(bson.A)
+	if !ok || len(branches) != 2 {
+		t.Fatalf("ownership branches = %#v, want canonical and canonical-missing branches", filter["$or"])
 	}
-	and, ok := filter["$and"].([]bson.M)
-	if !ok || len(and) != 1 {
-		t.Fatalf("$and = %#v, want exactly the project clause", filter["$and"])
+	canonical := branches[0].(bson.M)
+	if canonical["organisationId"] != organisation.Hex() {
+		t.Fatalf("canonical branch = %#v, want exact organisation ownership", canonical)
 	}
-	condition, ok := and[0]["projectId"].(bson.M)
+	assertProjectCondition(t, canonical, bson.M{"$in": bson.A{defaultProject, nil}})
+
+	legacy := branches[1].(bson.M)
+	organisationCondition, ok := legacy["organisationId"].(bson.M)
 	if !ok {
-		t.Fatalf("project clause = %#v, want a projectId condition", and[0])
+		t.Fatalf("legacy organisation clause = %#v, want missing/empty condition", legacy["organisationId"])
 	}
-	values, ok := condition["$in"].(bson.A)
-	if !ok || len(values) != 2 || values[0] != defaultProject || values[1] != nil {
-		t.Errorf("projectId condition = %#v, want $in [%v, nil]", condition, defaultProject)
+	if got := organisationCondition["$in"]; !bsonValuesEqual(got, bson.A{nil, ""}) {
+		t.Errorf("legacy organisation condition = %#v, want only null/missing or empty", organisationCondition)
 	}
+	assertProjectCondition(t, legacy, bson.M{"$in": bson.A{defaultProject, nil}})
 
 	t.Run("a real project matches only its own runs", func(t *testing.T) {
 		realProject := primitive.NewObjectID()
 		run := run
 		run.ProjectId = &realProject
 
-		and, ok := upsertFilter(run)["$and"].([]bson.M)
-		if !ok || len(and) != 1 {
-			t.Fatalf("$and = %#v, want exactly the project clause", and)
-		}
-		if and[0]["projectId"] != realProject {
-			t.Errorf("project clause = %#v, want strict equality on %v", and[0], realProject)
-		}
-		if _, tolerant := and[0]["$or"]; tolerant {
-			t.Error("a non-default project must not match unstamped runs: it would adopt " +
-				"a run that belongs to the organisation's default project")
+		branches := upsertFilter(run, true)["$or"].(bson.A)
+		for _, branch := range branches {
+			assertProjectCondition(t, branch.(bson.M), realProject)
 		}
 	})
 
-	t.Run("an unprojected run stays organisation-wide", func(t *testing.T) {
-		bare := upsertFilter(models.DetectionRun{Key: "media-1", OrganisationId: organisation.Hex()})
-		for _, key := range []string{"projectId", "$and"} {
-			if _, scoped := bare[key]; scoped {
-				t.Errorf("a run with no project must not gain a %q clause", key)
+	t.Run("an unprojected run requires exact canonical ownership", func(t *testing.T) {
+		bare := upsertFilter(models.DetectionRun{Key: "media-1", OrganisationId: organisation.Hex()}, true)
+		branches := bare["$or"].(bson.A)
+		if len(branches) != 1 || branches[0].(bson.M)["organisationId"] != organisation.Hex() {
+			t.Errorf("ownership branches = %#v, want exact canonical organisation only", branches)
+		}
+	})
+
+	t.Run("legacy adoption requires authoritative parent proof", func(t *testing.T) {
+		branches := upsertFilter(run, false)["$or"].(bson.A)
+		if len(branches) != 1 || branches[0].(bson.M)["organisationId"] != organisation.Hex() {
+			t.Errorf("ownership branches = %#v, want exact canonical ownership only", branches)
+		}
+	})
+}
+
+func TestParentMatchesRun(t *testing.T) {
+	organisation := primitive.NewObjectID()
+	defaultProject := models.DefaultProjectId(organisation)
+	nonDefaultProject := primitive.NewObjectID()
+	run := models.DetectionRun{OrganisationId: organisation.Hex(), ProjectId: &defaultProject}
+
+	tests := []struct {
+		name   string
+		parent analysisParent
+		run    models.DetectionRun
+		want   bool
+	}{
+		{
+			name:   "canonical default parent",
+			parent: analysisParent{OrganisationId: organisation.Hex()},
+			run:    run,
+			want:   true,
+		},
+		{
+			name:   "legacy userid default parent",
+			parent: analysisParent{UserId: organisation.Hex()},
+			run:    run,
+			want:   true,
+		},
+		{
+			name:   "legacy user_id default parent",
+			parent: analysisParent{LegacyUserId: organisation.Hex()},
+			run:    run,
+			want:   true,
+		},
+		{
+			name:   "canonical owner wins over matching legacy alias",
+			parent: analysisParent{OrganisationId: primitive.NewObjectID().Hex(), UserId: organisation.Hex()},
+			run:    run,
+		},
+		{
+			name:   "exact non-default parent",
+			parent: analysisParent{OrganisationId: organisation.Hex(), ProjectId: &nonDefaultProject},
+			run:    models.DetectionRun{OrganisationId: organisation.Hex(), ProjectId: &nonDefaultProject},
+			want:   true,
+		},
+		{
+			name:   "unstamped parent excluded from non-default project",
+			parent: analysisParent{OrganisationId: organisation.Hex()},
+			run:    models.DetectionRun{OrganisationId: organisation.Hex(), ProjectId: &nonDefaultProject},
+		},
+		{
+			name:   "missing run project fails closed",
+			parent: analysisParent{OrganisationId: organisation.Hex()},
+			run:    models.DetectionRun{OrganisationId: organisation.Hex()},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := parentMatchesRun(test.parent, test.run); got != test.want {
+				t.Fatalf("parentMatchesRun() = %v, want %v", got, test.want)
 			}
+		})
+	}
+}
+
+func TestUniqueParentMatchesRunRequiresExactlyOneParent(t *testing.T) {
+	organisation := primitive.NewObjectID()
+	projectId := models.DefaultProjectId(organisation)
+	run := models.DetectionRun{OrganisationId: organisation.Hex(), ProjectId: &projectId}
+	matching := analysisParent{OrganisationId: organisation.Hex()}
+
+	if uniqueParentMatchesRun(nil, run) {
+		t.Fatal("zero parents allowed legacy adoption")
+	}
+	if !uniqueParentMatchesRun([]analysisParent{matching}, run) {
+		t.Fatal("one authoritative parent did not allow legacy adoption")
+	}
+	if uniqueParentMatchesRun([]analysisParent{matching, matching}, run) {
+		t.Fatal("ambiguous parents allowed legacy adoption")
+	}
+}
+
+func assertProjectCondition(t *testing.T, branch bson.M, want any) {
+	t.Helper()
+	and, ok := branch["$and"].([]bson.M)
+	if !ok || len(and) != 1 {
+		t.Fatalf("project clauses = %#v, want exactly one", branch["$and"])
+	}
+	if got := and[0]["projectId"]; !bsonValuesEqual(got, want) {
+		t.Errorf("project condition = %#v, want %#v", got, want)
+	}
+}
+
+func bsonValuesEqual(got, want any) bool {
+	gotRaw, gotErr := bson.Marshal(bson.M{"value": got})
+	wantRaw, wantErr := bson.Marshal(bson.M{"value": want})
+	return gotErr == nil && wantErr == nil && string(gotRaw) == string(wantRaw)
+}
+
+type fakeDetectionCollection struct {
+	results []*mongo.UpdateResult
+	errors  []error
+	options []*options.UpdateOptions
+}
+
+func (f *fakeDetectionCollection) UpdateOne(_ context.Context, _, _ any, opts ...*options.UpdateOptions) (*mongo.UpdateResult, error) {
+	call := len(f.options)
+	if len(opts) == 0 {
+		f.options = append(f.options, nil)
+	} else {
+		f.options = append(f.options, opts[0])
+	}
+	return f.results[call], f.errors[call]
+}
+
+func TestUpsertDetectionRunDuplicateRetry(t *testing.T) {
+	duplicateErr := mongo.WriteException{WriteErrors: mongo.WriteErrors{{Code: 11000}}}
+	run := models.DetectionRun{Key: "media-1", OrganisationId: primitive.NewObjectID().Hex()}
+	run.Source.RunId = "run-1"
+
+	t.Run("matched retry succeeds", func(t *testing.T) {
+		coll := &fakeDetectionCollection{
+			results: []*mongo.UpdateResult{nil, {MatchedCount: 1}},
+			errors:  []error{duplicateErr, nil},
+		}
+		if err := upsertDetectionRun(context.Background(), coll, run, false); err != nil {
+			t.Fatalf("upsertDetectionRun: %v", err)
+		}
+		if len(coll.options) != 2 || coll.options[0] == nil || coll.options[0].Upsert == nil || !*coll.options[0].Upsert {
+			t.Fatalf("first write options = %#v, want upsert", coll.options)
+		}
+		if coll.options[1] != nil && coll.options[1].Upsert != nil && *coll.options[1].Upsert {
+			t.Fatal("duplicate retry must not upsert")
+		}
+	})
+
+	t.Run("unmatched retry reports the duplicate conflict", func(t *testing.T) {
+		coll := &fakeDetectionCollection{
+			results: []*mongo.UpdateResult{nil, {MatchedCount: 0}},
+			errors:  []error{duplicateErr, nil},
+		}
+		err := upsertDetectionRun(context.Background(), coll, run, false)
+		if err == nil {
+			t.Fatal("upsertDetectionRun returned nil after an unmatched duplicate retry")
+		}
+		if !mongo.IsDuplicateKeyError(err) {
+			t.Errorf("error = %v, want wrapped duplicate-key conflict", err)
+		}
+	})
+
+	t.Run("retry error is returned", func(t *testing.T) {
+		retryErr := errors.New("connection reset")
+		coll := &fakeDetectionCollection{
+			results: []*mongo.UpdateResult{nil, nil},
+			errors:  []error{duplicateErr, retryErr},
+		}
+		if err := upsertDetectionRun(context.Background(), coll, run, false); !errors.Is(err, retryErr) {
+			t.Fatalf("upsertDetectionRun error = %v, want %v", err, retryErr)
 		}
 	})
 }
