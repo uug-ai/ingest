@@ -76,11 +76,9 @@ func (s *Store) UpsertDetectionRun(ctx context.Context, run models.DetectionRun)
 // run. Callers that only implement ingest.DetectionStore should continue using
 // UpsertDetectionRun.
 func (s *Store) Upsert(ctx context.Context, run models.DetectionRun) (WriteResult, error) {
-	allowLegacyAdoption, err := canAdoptLegacyDetection(ctx, s.db.Collection("analysis"), run)
-	if err != nil {
-		return WriteResult{}, err
-	}
-	return upsertDetectionRun(ctx, s.db.Collection(DetectionsCollection), run, allowLegacyAdoption)
+	return upsertDetectionRun(ctx, s.db.Collection(DetectionsCollection), run, func() (bool, error) {
+		return canAdoptLegacyDetection(ctx, s.db.Collection("analysis"), run)
+	})
 }
 
 type analysisParent struct {
@@ -141,7 +139,7 @@ func parentMatchesRun(parent analysisParent, run models.DetectionRun) bool {
 	return *projectId == *run.ProjectId
 }
 
-func upsertDetectionRun(ctx context.Context, coll detectionCollection, run models.DetectionRun, allowLegacyAdoption bool) (WriteResult, error) {
+func upsertDetectionRun(ctx context.Context, coll detectionCollection, run models.DetectionRun, resolveLegacyAdoption func() (bool, error)) (WriteResult, error) {
 	now := time.Now().UnixMilli()
 
 	// Server-owned identity / denormalised fields. _id and createdAt are left
@@ -151,7 +149,7 @@ func upsertDetectionRun(ctx context.Context, coll detectionCollection, run model
 	run.CreatedAt = 0
 	run.UpdatedAt = now
 
-	filter := upsertFilter(run, allowLegacyAdoption)
+	filter := upsertFilter(run, false)
 	update := bson.M{
 		"$set":         run,
 		"$setOnInsert": bson.M{"createdAt": now},
@@ -165,13 +163,27 @@ func upsertDetectionRun(ctx context.Context, coll detectionCollection, run model
 		// owned by conflicting canonical scope does not match this filter; do not
 		// report that conflict as a successful write.
 		duplicateErr := err
-		var retryErr error
-		result, retryErr = coll.UpdateOne(ctx, filter, update)
+		result, retryErr := coll.UpdateOne(ctx, filter, update)
+		if retryErr != nil {
+			return WriteResult{}, retryErr
+		}
+		if result != nil && result.MatchedCount > 0 {
+			return WriteResult{Replaced: true}, nil
+		}
+
+		allowLegacyAdoption, adoptionErr := resolveLegacyAdoption()
+		if adoptionErr != nil {
+			return WriteResult{}, adoptionErr
+		}
+		if !allowLegacyAdoption {
+			return WriteResult{}, fmt.Errorf("detections: duplicate-key retry matched no document: %w", duplicateErr)
+		}
+		result, retryErr = coll.UpdateOne(ctx, upsertFilter(run, true), update)
 		if retryErr != nil {
 			return WriteResult{}, retryErr
 		}
 		if result == nil || result.MatchedCount == 0 {
-			return WriteResult{}, fmt.Errorf("detections: duplicate-key retry matched no document: %w", duplicateErr)
+			return WriteResult{}, fmt.Errorf("detections: legacy adoption matched no document: %w", duplicateErr)
 		}
 		return WriteResult{Replaced: true}, nil
 	}

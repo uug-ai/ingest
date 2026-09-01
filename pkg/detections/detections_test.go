@@ -267,10 +267,12 @@ type fakeDetectionCollection struct {
 	results []*mongo.UpdateResult
 	errors  []error
 	options []*options.UpdateOptions
+	filters []any
 }
 
-func (f *fakeDetectionCollection) UpdateOne(_ context.Context, _, _ any, opts ...*options.UpdateOptions) (*mongo.UpdateResult, error) {
+func (f *fakeDetectionCollection) UpdateOne(_ context.Context, filter, _ any, opts ...*options.UpdateOptions) (*mongo.UpdateResult, error) {
 	call := len(f.options)
+	f.filters = append(f.filters, filter)
 	if len(opts) == 0 {
 		f.options = append(f.options, nil)
 	} else {
@@ -281,7 +283,9 @@ func (f *fakeDetectionCollection) UpdateOne(_ context.Context, _, _ any, opts ..
 
 func TestUpsertDetectionRunDuplicateRetry(t *testing.T) {
 	duplicateErr := mongo.WriteException{WriteErrors: mongo.WriteErrors{{Code: 11000}}}
-	run := models.DetectionRun{Key: "media-1", OrganisationId: primitive.NewObjectID().Hex()}
+	organisationId := primitive.NewObjectID()
+	projectId := models.DefaultProjectId(organisationId)
+	run := models.DetectionRun{Key: "media-1", OrganisationId: organisationId.Hex(), ProjectId: &projectId}
 	run.Source.RunId = "run-1"
 
 	t.Run("matched retry succeeds", func(t *testing.T) {
@@ -289,7 +293,10 @@ func TestUpsertDetectionRunDuplicateRetry(t *testing.T) {
 			results: []*mongo.UpdateResult{nil, {MatchedCount: 1}},
 			errors:  []error{duplicateErr, nil},
 		}
-		result, err := upsertDetectionRun(context.Background(), coll, run, false)
+		result, err := upsertDetectionRun(context.Background(), coll, run, func() (bool, error) {
+			t.Fatal("ordinary canonical retry must not resolve a legacy parent")
+			return false, nil
+		})
 		if err != nil {
 			t.Fatalf("upsertDetectionRun: %v", err)
 		}
@@ -309,7 +316,7 @@ func TestUpsertDetectionRunDuplicateRetry(t *testing.T) {
 			results: []*mongo.UpdateResult{nil, {MatchedCount: 0}},
 			errors:  []error{duplicateErr, nil},
 		}
-		_, err := upsertDetectionRun(context.Background(), coll, run, false)
+		_, err := upsertDetectionRun(context.Background(), coll, run, func() (bool, error) { return false, nil })
 		if err == nil {
 			t.Fatal("upsertDetectionRun returned nil after an unmatched duplicate retry")
 		}
@@ -324,9 +331,40 @@ func TestUpsertDetectionRunDuplicateRetry(t *testing.T) {
 			results: []*mongo.UpdateResult{nil, nil},
 			errors:  []error{duplicateErr, retryErr},
 		}
-		if _, err := upsertDetectionRun(context.Background(), coll, run, false); !errors.Is(err, retryErr) {
+		if _, err := upsertDetectionRun(context.Background(), coll, run, func() (bool, error) {
+			t.Fatal("failed canonical retry must not resolve a legacy parent")
+			return false, nil
+		}); !errors.Is(err, retryErr) {
 			t.Fatalf("upsertDetectionRun error = %v, want %v", err, retryErr)
 		}
+	})
+
+	t.Run("legacy collision resolves parent and adopts", func(t *testing.T) {
+		coll := &fakeDetectionCollection{
+			results: []*mongo.UpdateResult{nil, {MatchedCount: 0}, {MatchedCount: 1}},
+			errors:  []error{duplicateErr, nil, nil},
+		}
+		resolved := 0
+		result, err := upsertDetectionRun(context.Background(), coll, run, func() (bool, error) {
+			resolved++
+			return true, nil
+		})
+		if err != nil || !result.Replaced || resolved != 1 {
+			t.Fatalf("legacy adoption = (%+v, %v), resolver calls %d", result, err, resolved)
+		}
+		if len(coll.options) != 3 || coll.options[2] != nil {
+			t.Fatalf("legacy adoption options = %#v, want final non-upsert retry", coll.options)
+		}
+		filter := coll.filters[2].(bson.M)
+		branches := filter["$or"].(bson.A)
+		if len(branches) != 2 {
+			t.Fatalf("legacy adoption branches = %#v, want canonical and canonical-missing", branches)
+		}
+		legacyOrganisation := branches[1].(bson.M)["organisationId"].(bson.M)
+		if !bsonValuesEqual(legacyOrganisation["$in"], bson.A{nil, ""}) {
+			t.Fatalf("legacy organisation filter = %#v, want null/empty", legacyOrganisation)
+		}
+		assertProjectCondition(t, branches[1].(bson.M), bson.M{"$in": bson.A{projectId, nil}})
 	})
 }
 
@@ -347,7 +385,10 @@ func TestUpsertDetectionRunResult(t *testing.T) {
 				results: []*mongo.UpdateResult{test.mongoResult},
 				errors:  []error{nil},
 			}
-			result, err := upsertDetectionRun(t.Context(), coll, run, false)
+			result, err := upsertDetectionRun(t.Context(), coll, run, func() (bool, error) {
+				t.Fatal("successful write must not resolve a legacy parent")
+				return false, nil
+			})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -362,7 +403,10 @@ func TestUpsertDetectionRunResult(t *testing.T) {
 			results: []*mongo.UpdateResult{nil},
 			errors:  []error{nil},
 		}
-		if _, err := upsertDetectionRun(t.Context(), coll, run, false); err == nil {
+		if _, err := upsertDetectionRun(t.Context(), coll, run, func() (bool, error) {
+			t.Fatal("successful write must not resolve a legacy parent")
+			return false, nil
+		}); err == nil {
 			t.Fatal("nil successful result must fail closed")
 		}
 	})
