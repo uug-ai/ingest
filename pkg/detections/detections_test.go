@@ -203,6 +203,11 @@ func TestParentMatchesRun(t *testing.T) {
 			run:    run,
 		},
 		{
+			name:   "userid wins over user_id",
+			parent: analysisParent{UserId: primitive.NewObjectID().Hex(), LegacyUserId: organisation.Hex()},
+			run:    run,
+		},
+		{
 			name:   "exact non-default parent",
 			parent: analysisParent{OrganisationId: organisation.Hex(), ProjectId: &nonDefaultProject},
 			run:    models.DetectionRun{OrganisationId: organisation.Hex(), ProjectId: &nonDefaultProject},
