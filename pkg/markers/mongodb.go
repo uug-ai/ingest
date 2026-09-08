@@ -497,12 +497,32 @@ func addMarker(ctxTracer context.Context, tracer *opentelemetry.Tracer, client *
 // The project clause composes under $and rather than being merged into this
 // map, so its own $or (the tolerant form) stays intact.
 func markerUpsertFilter(marker models.Marker) bson.M {
-	return projectfilter.Apply(bson.M{
+	filter := bson.M{
 		"organisationId": marker.OrganisationId,
 		"deviceId":       marker.DeviceId,
 		"name":           marker.Name,
 		"startTimestamp": marker.StartTimestamp,
-	}, marker.OrganisationId, marker.ProjectId)
+	}
+	if len(marker.Detections) > 0 {
+		references := make([]bson.M, 0, len(marker.Detections))
+		for _, detection := range marker.Detections {
+			if detection.RunId == "" || detection.TrackId == "" {
+				continue
+			}
+			references = append(references, bson.M{"$elemMatch": bson.M{
+				"runId":   detection.RunId,
+				"trackId": detection.TrackId,
+			}})
+		}
+		if len(references) > 0 {
+			filter["$or"] = []bson.M{
+				{"detections": bson.M{"$all": references}},
+				{"detections": bson.M{"$exists": false}},
+				{"detections": bson.M{"$size": 0}},
+			}
+		}
+	}
+	return projectfilter.Apply(filter, marker.OrganisationId, marker.ProjectId)
 }
 
 // mediaLinkFilter selects the recording a marker names explicitly, by its key

@@ -545,6 +545,55 @@ func TestMarkerUpsertFilterKeepsBothAxes(t *testing.T) {
 	assertTolerantProjectScope(t, filter, projectId)
 }
 
+func TestMarkerUpsertFilterIncludesDetectionIdentity(t *testing.T) {
+	filter := markerUpsertFilter(models.Marker{
+		OrganisationId: "organisation-1",
+		DeviceId:       "device-1",
+		Name:           "car",
+		StartTimestamp: 1000,
+		Detections: []models.DetectionRef{
+			{RunId: "run-1", TrackId: "track-1"},
+			{RunId: "run-1", TrackId: "track-2"},
+		},
+	})
+
+	alternatives, ok := filter["$or"].([]bson.M)
+	if !ok || len(alternatives) != 3 {
+		t.Fatalf("$or = %#v, want linked and legacy alternatives", filter["$or"])
+	}
+	detections, ok := alternatives[0]["detections"].(bson.M)
+	if !ok {
+		t.Fatalf("detections = %#v, want BSON filter", alternatives[0]["detections"])
+	}
+	all, ok := detections["$all"].([]bson.M)
+	if !ok || len(all) != 2 {
+		t.Fatalf("$all = %#v, want two detection references", detections["$all"])
+	}
+	for index, wantTrack := range []string{"track-1", "track-2"} {
+		elemMatch, ok := all[index]["$elemMatch"].(bson.M)
+		if !ok || elemMatch["runId"] != "run-1" || elemMatch["trackId"] != wantTrack {
+			t.Errorf("reference %d = %#v, want run-1:%s", index, all[index], wantTrack)
+		}
+	}
+	if alternatives[1]["detections"] == nil || alternatives[2]["detections"] == nil {
+		t.Fatalf("$or = %#v, want missing and empty legacy detection alternatives", alternatives)
+	}
+}
+
+func TestMarkerUpsertFilterIgnoresIncompleteDetectionIdentity(t *testing.T) {
+	filter := markerUpsertFilter(models.Marker{
+		OrganisationId: "organisation-1",
+		DeviceId:       "device-1",
+		Name:           "car",
+		StartTimestamp: 1000,
+		Detections:     []models.DetectionRef{{TrackId: "track-1"}},
+	})
+
+	if _, exists := filter["detections"]; exists {
+		t.Fatalf("filter = %#v, want legacy identity for incomplete reference", filter)
+	}
+}
+
 // projectClause returns the single project clause Apply nested under $and.
 func projectClause(t *testing.T, filter bson.M) bson.M {
 	t.Helper()
