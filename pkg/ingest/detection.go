@@ -43,6 +43,7 @@ const (
 	reasonMissingGeom    = "box_missing_geometry"
 	reasonNonPositiveDim = "box_non_positive_dimensions"
 	reasonMissingScale   = "box_missing_media_scale"
+	reasonInvalidTime    = "box_invalid_timestamp"
 )
 
 // Box geometry forms recorded in DetectionRun.OriginalBoxForm.
@@ -292,6 +293,15 @@ func (boxTask) Normalize(req api.PostDetectionsRequest) (models.DetectionRun, Re
 		for _, b := range t.Boxes {
 			totalBoxes++
 
+			if b.TimestampMs != nil && *b.TimestampMs < 0 {
+				detail.Rejected = append(detail.Rejected, api.DetectionRejection{
+					TrackId: trackId,
+					Frame:   b.Frame,
+					Reason:  reasonInvalidTime,
+				})
+				continue
+			}
+
 			switch boxForm(b) {
 			case boxFormXYWH:
 				sawXYWH = true
@@ -300,9 +310,9 @@ func (boxTask) Normalize(req api.PostDetectionsRequest) (models.DetectionRun, Re
 			}
 
 			// Non-fatal consistency checks surfaced as warnings.
-			if req.Media.Fps > 0 && b.TimestampMs > 0 {
+			if req.Media.Fps > 0 && b.TimestampMs != nil {
 				expected := float64(b.Frame) * 1000.0 / req.Media.Fps
-				if math.Abs(float64(b.TimestampMs)-expected) > 1000.0/req.Media.Fps {
+				if math.Abs(float64(*b.TimestampMs)-expected) > 1000.0/req.Media.Fps {
 					timestampMismatches++
 				}
 			}
@@ -327,6 +337,7 @@ func (boxTask) Normalize(req api.PostDetectionsRequest) (models.DetectionRun, Re
 			box.Confidence = b.Confidence
 			box.ClassId = b.ClassId
 			box.Label = b.Label
+			box.TimestampMs = b.TimestampMs
 			if _, dup := frameCoords[b.Frame]; dup {
 				// A track must not carry two boxes for the same frame; the
 				// later one overwrites the earlier. Surface this so producers
