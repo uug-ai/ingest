@@ -6,6 +6,7 @@ import (
 	"errors"
 	"testing"
 
+	api "github.com/uug-ai/models/pkg/api"
 	"github.com/uug-ai/models/pkg/models"
 )
 
@@ -130,6 +131,7 @@ func TestIngest_XYWHFormDetected(t *testing.T) {
 			}},
 		},
 	}
+
 	raw, _ := json.Marshal(body)
 
 	if _, err := Ingest(context.Background(), scope, target(), "detection", raw); err != nil {
@@ -143,6 +145,79 @@ func TestIngest_XYWHFormDetected(t *testing.T) {
 	box := run.Tracks[0].FrameCoordinates[0]
 	if !approx(box.X2, 0.3) || !approx(box.Y2, 0.3) {
 		t.Errorf("converted box = %+v, want x2=0.3 y2=0.3", box)
+	}
+}
+
+func TestIngest_PreservesOptionalTimestampMs(t *testing.T) {
+	tests := []struct {
+		name             string
+		includeTimestamp bool
+		timestampMs      int64
+		wantWarnings     int
+	}{
+		{name: "omitted"},
+		{name: "explicit zero", includeTimestamp: true},
+		{name: "presentation timestamp", includeTimestamp: true, timestampMs: 1200, wantWarnings: 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			scope, store, _ := newScope(SourceAPI)
+			box := map[string]any{
+				"frame": 0,
+				"x1":    0.1,
+				"y1":    0.1,
+				"x2":    0.3,
+				"y2":    0.4,
+			}
+			if tt.includeTimestamp {
+				box["timestampMs"] = tt.timestampMs
+			}
+			body := map[string]any{
+				"source":          map[string]any{"runId": "RUN-TIME"},
+				"coordinateSpace": "normalized",
+				"media":           map[string]any{"fps": 10},
+				"tracks":          []any{map[string]any{"id": "trk", "boxes": []any{box}}},
+			}
+			raw, _ := json.Marshal(body)
+
+			report, err := Ingest(context.Background(), scope, target(), "detection", raw)
+			if err != nil {
+				t.Fatalf("Ingest: %v", err)
+			}
+			stored := store.runs[0].Tracks[0].FrameCoordinates[0].TimestampMs
+			if !tt.includeTimestamp {
+				if stored != nil {
+					t.Fatalf("timestampMs = %d, want nil", *stored)
+				}
+			} else if stored == nil || *stored != tt.timestampMs {
+				t.Fatalf("timestampMs = %v, want %d", stored, tt.timestampMs)
+			}
+			if len(report.Warnings) != tt.wantWarnings {
+				t.Fatalf("warnings = %v, want %d warning(s)", report.Warnings, tt.wantWarnings)
+			}
+		})
+	}
+}
+
+func TestIngest_RejectsNegativeTimestampMs(t *testing.T) {
+	body := map[string]any{
+		"source":          map[string]any{"runId": "RUN-NEGATIVE-TIME"},
+		"coordinateSpace": "normalized",
+		"tracks": []any{map[string]any{"id": "trk", "boxes": []any{
+			map[string]any{"frame": 0, "timestampMs": -1, "x1": 0.1, "y1": 0.1, "x2": 0.3, "y2": 0.4},
+		}}},
+	}
+	raw, _ := json.Marshal(body)
+	var req api.PostDetectionsRequest
+	if err := json.Unmarshal(raw, &req); err != nil {
+		t.Fatalf("unmarshal request: %v", err)
+	}
+
+	_, report := (boxTask{}).Normalize(req)
+	detail := report.Detail.(DetectionDetail)
+	if len(detail.Rejected) != 1 || detail.Rejected[0].Reason != reasonInvalidTime {
+		t.Fatalf("rejected = %+v, want one %q rejection", detail.Rejected, reasonInvalidTime)
 	}
 }
 
