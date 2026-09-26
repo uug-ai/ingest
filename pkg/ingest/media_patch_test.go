@@ -6,6 +6,8 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/uug-ai/models/pkg/models"
+	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
@@ -246,6 +248,20 @@ func TestDecodeMediaPatch_AcceptsDocumentedFieldTypes(t *testing.T) {
 			"tagNames":    []string{},
 			"eventNames":  []string{"motion"},
 			"markerNames": []string{"person"},
+			"vlm": map[string]any{
+				"schemaVersion": 1,
+				"scene": map[string]any{
+					"summary":        "Office entrance with a desk and glass door",
+					"staticElements": []string{"desk", "glass door", "chairs"},
+					"zones":          []string{"entrance", "work area"},
+					"lighting":       "indoor daylight",
+				},
+				"observations": []map[string]any{{
+					"marker": "person",
+					"event":  "walking",
+					"tags":   []string{"red", "sweater"},
+				}},
+			},
 		})},
 	})
 	if err != nil {
@@ -256,6 +272,69 @@ func TestDecodeMediaPatch_AcceptsDocumentedFieldTypes(t *testing.T) {
 	}
 	if _, ok := store.calls[0].fields["tagNames"].([]string); !ok {
 		t.Errorf("tagNames type = %T, want []string", store.calls[0].fields["tagNames"])
+	}
+	vlm, ok := store.calls[0].fields["metadata.vlm"].(models.VLMMediaMetadata)
+	if !ok || vlm.SchemaVersion != 1 || len(vlm.Observations) != 1 || vlm.Observations[0].Event != "walking" {
+		t.Fatalf("metadata.vlm = %#v, want validated VLM metadata", store.calls[0].fields["metadata.vlm"])
+	}
+
+	// The patch value is $set as-is, so its BSON field names must match the
+	// camelCase names every reader of metadata.vlm decodes.
+	raw, err := bson.Marshal(vlm)
+	if err != nil {
+		t.Fatalf("bson.Marshal: %v", err)
+	}
+	doc := bson.Raw(raw)
+	for _, path := range [][]string{
+		{"schemaVersion"},
+		{"scene", "summary"},
+		{"scene", "staticElements"},
+		{"observations"},
+	} {
+		if _, err := doc.LookupErr(path...); err != nil {
+			t.Errorf("stored metadata.vlm is missing %v: %v", path, err)
+		}
+	}
+}
+
+func TestDecodeMediaPatchRejectsInvalidVLMMetadata(t *testing.T) {
+	validID := primitive.NewObjectID().Hex()
+	validScene := map[string]any{
+		"summary":        "Office entrance",
+		"staticElements": []string{"desk"},
+		"zones":          []string{"entrance"},
+		"lighting":       "daylight",
+	}
+	cases := map[string]any{
+		"wrong schema": map[string]any{"schemaVersion": 2, "scene": validScene, "observations": []any{}},
+		"missing scene summary": map[string]any{
+			"schemaVersion": 1,
+			"scene":         map[string]any{"summary": "", "staticElements": []any{}, "zones": []any{}, "lighting": ""},
+			"observations":  []any{},
+		},
+		"empty marker": map[string]any{
+			"schemaVersion": 1,
+			"scene":         validScene,
+			"observations":  []map[string]any{{"marker": "", "event": "walking", "tags": []any{}}},
+		},
+		"unknown field": map[string]any{
+			"schemaVersion": 1,
+			"scene":         validScene,
+			"observations":  []any{},
+			"raw":           true,
+		},
+	}
+
+	scope := Scope{Source: SourcePipeline, Media: &fakeMediaPatcher{}}
+	for name, vlm := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := IngestBlocks(context.Background(), scope, target(), BlockEnvelope{
+				Blocks: []Block{mediaPatchBlock(t, map[string]any{"mediaId": validID, "vlm": vlm})},
+			})
+			if !errors.Is(err, ErrMediaPatchValidation) {
+				t.Fatalf("err = %v, want ErrMediaPatchValidation", err)
+			}
+		})
 	}
 }
 

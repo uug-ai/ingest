@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 
+	"github.com/uug-ai/models/pkg/models"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
@@ -69,7 +71,16 @@ var mediaPatchableFields = map[string]string{
 	"tagNames":    "tagNames",
 	"eventNames":  "eventNames",
 	"markerNames": "markerNames",
+	"vlm":         "metadata.vlm",
 }
+
+const (
+	maxVLMSceneItems       = 32
+	maxVLMObservations     = 32
+	maxVLMObservationTags  = 8
+	maxVLMShortTextLength  = 128
+	maxVLMSceneSummarySize = 1000
+)
 
 // --- Kind handler ----------------------------------------------------------
 
@@ -218,9 +229,74 @@ func decodeMediaPatchValue(key string, raw json.RawMessage) (any, error) {
 			return nil, errors.New("must be an array of strings")
 		}
 		return value, nil
+	case "vlm":
+		return decodeVLMMetadataPatch(raw)
 	default:
 		return nil, errors.New("is not patchable")
 	}
+}
+
+// decodeVLMMetadataPatch validates the vlm field and returns it as the shared
+// models type, whose bson tags keep the stored metadata.vlm field names in the
+// same camelCase that readers decode.
+func decodeVLMMetadataPatch(raw json.RawMessage) (models.VLMMediaMetadata, error) {
+	var value models.VLMMediaMetadata
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&value); err != nil {
+		return value, errors.New("must be valid VLM metadata")
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return value, errors.New("must contain one VLM metadata object")
+	}
+	if value.SchemaVersion != models.VLMSchemaVersion {
+		return value, fmt.Errorf("schemaVersion must be %d", models.VLMSchemaVersion)
+	}
+	if strings.TrimSpace(value.Scene.Summary) == "" || len(value.Scene.Summary) > maxVLMSceneSummarySize {
+		return value, fmt.Errorf("scene.summary must contain 1 to %d characters", maxVLMSceneSummarySize)
+	}
+	if len(value.Scene.StaticElements) > maxVLMSceneItems {
+		return value, fmt.Errorf("scene.staticElements must contain at most %d items", maxVLMSceneItems)
+	}
+	if len(value.Scene.Zones) > maxVLMSceneItems {
+		return value, fmt.Errorf("scene.zones must contain at most %d items", maxVLMSceneItems)
+	}
+	if err := validateVLMStrings(value.Scene.StaticElements, "scene.staticElements", maxVLMShortTextLength); err != nil {
+		return value, err
+	}
+	if err := validateVLMStrings(value.Scene.Zones, "scene.zones", maxVLMShortTextLength); err != nil {
+		return value, err
+	}
+	if len(value.Scene.Lighting) > maxVLMShortTextLength {
+		return value, fmt.Errorf("scene.lighting must contain at most %d characters", maxVLMShortTextLength)
+	}
+	if len(value.Observations) > maxVLMObservations {
+		return value, fmt.Errorf("observations must contain at most %d items", maxVLMObservations)
+	}
+	for i, observation := range value.Observations {
+		if strings.TrimSpace(observation.Marker) == "" || len(observation.Marker) > maxVLMShortTextLength {
+			return value, fmt.Errorf("observations[%d].marker must contain 1 to %d characters", i, maxVLMShortTextLength)
+		}
+		if strings.TrimSpace(observation.Event) == "" || len(observation.Event) > maxVLMShortTextLength {
+			return value, fmt.Errorf("observations[%d].event must contain 1 to %d characters", i, maxVLMShortTextLength)
+		}
+		if len(observation.Tags) > maxVLMObservationTags {
+			return value, fmt.Errorf("observations[%d].tags must contain at most %d items", i, maxVLMObservationTags)
+		}
+		if err := validateVLMStrings(observation.Tags, fmt.Sprintf("observations[%d].tags", i), maxVLMShortTextLength); err != nil {
+			return value, err
+		}
+	}
+	return value, nil
+}
+
+func validateVLMStrings(values []string, field string, maxLength int) error {
+	for i, value := range values {
+		if strings.TrimSpace(value) == "" || len(value) > maxLength {
+			return fmt.Errorf("%s[%d] must contain 1 to %d characters", field, i, maxLength)
+		}
+	}
+	return nil
 }
 
 // --- Action ----------------------------------------------------------------
