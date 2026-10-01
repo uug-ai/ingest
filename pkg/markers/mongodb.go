@@ -132,6 +132,8 @@ func addMarker(ctxTracer context.Context, tracer *opentelemetry.Tracer, client *
 	db := client.Database(DatabaseName)
 	c := db.Collection(MARKERS_COLLECTION)
 
+	marker = markerWithWriteAudit(marker, time.Now().UTC().Truncate(time.Millisecond))
+
 	if idempotent {
 		// Upsert by stable identity so a redelivery refreshes the marker instead
 		// of inserting a duplicate. _id is owned by the first insert and never
@@ -149,31 +151,20 @@ func addMarker(ctxTracer context.Context, tracer *opentelemetry.Tracer, client *
 		// ProjectId `bson:"projectId,omitempty"` and addMarker has already
 		// resolved it — so a fresh insert is stamped and a matched legacy marker
 		// is back-filled by this same operation.
-		set, err := markerSetDoc(marker)
+		update, err := markerUpsertPipeline(marker)
 		if err != nil {
 			return models.Marker{}, err
 		}
 		filter := markerUpsertFilter(marker)
-		update := bson.M{
-			"$set":         set,
-			"$setOnInsert": bson.M{"_id": primitive.NewObjectID()},
-		}
-		res, err := c.UpdateOne(ctx, filter, update, options.Update().SetUpsert(true))
-		if err != nil {
+		// Return the atomic post-image, including the stored creation audit.
+		// A separate read can race another writer and must not hide read errors.
+		var stored models.Marker
+		if err := c.FindOneAndUpdate(ctx, filter, update,
+			options.FindOneAndUpdate().SetUpsert(true).SetReturnDocument(options.After),
+		).Decode(&stored); err != nil {
 			return models.Marker{}, err
 		}
-		// Resolve the marker's _id for the returned value: the upserted id on a
-		// fresh insert, otherwise the existing document's id.
-		if oid, ok := res.UpsertedID.(primitive.ObjectID); ok {
-			marker.Id = oid
-		} else {
-			var existing struct {
-				Id primitive.ObjectID `bson:"_id"`
-			}
-			if err := c.FindOne(ctx, filter, options.FindOne().SetProjection(bson.M{"_id": 1})).Decode(&existing); err == nil {
-				marker.Id = existing.Id
-			}
-		}
+		marker = stored
 	} else {
 		// Generate new ID for the marker
 		marker.Id = primitive.NewObjectID()
@@ -660,6 +651,56 @@ func markerSummaryEntry(marker models.Marker) (bson.M, bool) {
 		return nil, false
 	}
 	return entry, true
+}
+
+// markerWithWriteAudit owns its audit copy: callers may reuse the input across
+// retries. New documents get write-time creation stamps, never event time.
+func markerWithWriteAudit(marker models.Marker, now time.Time) models.Marker {
+	audit := models.Audit{}
+	if marker.Audit != nil {
+		audit = *marker.Audit
+	}
+	audit.CreatedAt = now
+	audit.UpdatedAt = now
+	marker.Audit = &audit
+	return marker
+}
+
+// markerUpsertPipeline preserves creation provenance atomically while refreshing
+// updatedAt on every write, even when the caller replays an old audit object.
+// Literal wrappers keep producer strings such as "$motion" as data.
+func markerUpsertPipeline(marker models.Marker) (mongo.Pipeline, error) {
+	doc, err := markerSetDoc(marker)
+	if err != nil {
+		return nil, err
+	}
+	audit := doc["audit"]
+	delete(doc, "audit")
+	set := bson.M{}
+	for key, value := range doc {
+		set[key] = bson.M{"$literal": value}
+	}
+	set["_id"] = bson.M{"$ifNull": bson.A{"$_id", primitive.NewObjectID()}}
+	set["audit"] = bson.M{"$mergeObjects": bson.A{
+		bson.M{"$ifNull": bson.A{"$audit", bson.M{}}},
+		bson.M{"$literal": audit},
+		bson.M{
+			"createdAt": preserveMarkerCreation("$audit.createdAt", marker.Audit.CreatedAt, time.Time{}),
+			"createdBy": preserveMarkerCreation("$audit.createdBy", marker.Audit.CreatedBy, ""),
+		},
+	}}
+	return mongo.Pipeline{bson.D{{Key: "$set", Value: set}}}, nil
+}
+
+func preserveMarkerCreation(path string, fallback, zero any) bson.M {
+	return bson.M{"$cond": bson.A{
+		bson.M{"$in": bson.A{
+			bson.M{"$ifNull": bson.A{path, nil}},
+			bson.A{nil, "", zero},
+		}},
+		bson.M{"$literal": fallback},
+		path,
+	}}
 }
 
 // markerSetDoc marshals a marker through BSON (so its bson tags / omitempty
