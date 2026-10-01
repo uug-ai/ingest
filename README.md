@@ -80,6 +80,24 @@ The concrete Mongo sinks live one layer up, in sibling packages the composition
 root wires through `pkg/ingeststore`: `pkg/detections`, `pkg/markers`, and
 `pkg/media` (the media-patch `$set` writer).
 
+### Marker write timestamps
+
+Both shared marker writers stamp `audit.updatedAt` with the writer's current UTC
+time (BSON date, millisecond precision), including unchanged replays. Fresh
+inserts initialize `audit.createdAt` to that same write time and retain supplied
+actor/action provenance. Upserts atomically preserve stored nonempty `createdAt`
+and `createdBy`; missing, null, empty, or zero creation stamps are initialized
+when touched. Caller-owned audit objects are never mutated. The upsert returns
+the stored post-image, including its audit, and propagates read/decode errors.
+
+Upserts use MongoDB update pipelines (MongoDB 4.2+). Deploy this writer to **all**
+marker-producing services before relying on incremental polling of
+`audit.updatedAt`. Existing untouched markers are not backfilled: bootstrap a
+snapshot before polling. Timestamps reflect writer clocks, not event time or a
+strictly increasing sequence; keep clocks synchronized and use an overlap window
+with deduplication for equal-millisecond writes, clock skew, and in-flight writes.
+No ownership migration is required.
+
 ## Development
 
 This module is part of the platform monorepo and resolves its sibling modules
@@ -90,3 +108,6 @@ against the published `github.com/uug-ai/models` release pinned in `go.mod`.
 go build ./...
 go test ./...
 ```
+
+Marker writer integration tests run when `MARKERS_TEST_MONGO_URI` is set; they
+use isolated databases and remove them afterward.
